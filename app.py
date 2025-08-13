@@ -51,6 +51,15 @@ def serialize_message(m: "Message"):
         "session_id": m.session_id,
     }
 
+# ✅ UPEWNIJ SIĘ, ŻE TABELA POWSTANIE RÓWNIEŻ W PRODUKCJI (Railway/gunicorn)
+# (musi być PO definicji modelu Message)
+try:
+    with app.app_context():
+        db.create_all()
+        print("✅ DB tables ensured")
+except Exception as e:
+    print("⚠️ DB init error:", e)
+
 # 🎙️ ElevenLabs TTS
 def synthesize_speech(text: str, voice_id: str = None, model_id: str = None) -> bytes:
     """
@@ -377,6 +386,9 @@ if __name__ == '__main__':
         db.create_all()
     # W produkcji użyj gunicorn/uvicorn; lokalnie:
     app.run(port=5000)
+
+
+
 
 
 
