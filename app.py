@@ -13,27 +13,33 @@ import base64
 load_dotenv()
 
 app = Flask(__name__)
-# W produkcji rozważ zawężenie CORS do konkretnych domen:
-# CORS(app, resources={r"/api/*": {"origins": ["https://twoja-domena.pl", "http://localhost:5173"]}})
-CORS(app)
 
-# 🔐 Klucze i DB
+# ── CORS ───────────────────────────────────────────────────────────────────────
+# Produkcyjnie możesz zawęzić do konkretnych domen podając env CORS_ORIGIN="https://jackqs.ai,https://www.jackqs.ai"
+cors_origins = os.getenv("CORS_ORIGIN")
+if cors_origins:
+    origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+    CORS(app, resources={r"/api/*": {"origins": origins}})
+else:
+    CORS(app)
+
+# ── Klucze, DB ────────────────────────────────────────────────────────────────
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL", "sqlite:///app.db")
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///app.db")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
-# ⚙️ Konfiguracja
+# ── Konfiguracja ──────────────────────────────────────────────────────────────
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "4000"))  # limit bezpieczeństwa
 
-# 📁 Pliki (lokalny backup historii i beliefs)
+# ── Pliki (lokalny backup historii i beliefs) ─────────────────────────────────
 HISTORY_FILE = "history.json"
 BELIEFS_FILE = "core_beliefs.json"
 
-# 🧠 MODEL
+# ── MODELE DB ────────────────────────────────────────────────────────────────
 class Message(db.Model):
-    __tablename__ = 'Message'
+    __tablename__ = "Message"
     id = db.Column(db.Integer, primary_key=True)
     role = db.Column(db.String(10))          # 'user' | 'jack'
     content = db.Column(db.Text)
@@ -51,8 +57,7 @@ def serialize_message(m: "Message"):
         "session_id": m.session_id,
     }
 
-# ✅ UPEWNIJ SIĘ, ŻE TABELA POWSTANIE RÓWNIEŻ W PRODUKCJI (Railway/gunicorn)
-# (musi być PO definicji modelu Message)
+# ✅ Upewnij się, że tabele powstaną także w produkcji (Railway/gunicorn)
 try:
     with app.app_context():
         db.create_all()
@@ -60,7 +65,7 @@ try:
 except Exception as e:
     print("⚠️ DB init error:", e)
 
-# 🎙️ ElevenLabs TTS
+# ── ElevenLabs TTS ───────────────────────────────────────────────────────────
 def synthesize_speech(text: str, voice_id: str = None, model_id: str = None) -> bytes:
     """
     Zwraca bajty MP3 z ElevenLabs.
@@ -70,29 +75,23 @@ def synthesize_speech(text: str, voice_id: str = None, model_id: str = None) -> 
     if not api_key:
         raise RuntimeError("ELEVENLABS_API_KEY not set in environment")
 
-    # Parametry z żądania mają pierwszeństwo, potem .env, na końcu domyślna wartość modelu
+    # Parametry z żądania mają pierwszeństwo, potem .env
     voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID", "")
     model_id = model_id or os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 
     if not voice_id:
         raise RuntimeError("VOICE_ID missing: pass `voice_id` in request or set ELEVENLABS_VOICE_ID in .env")
 
-    # Przytnij nadmiernie długi tekst (ochrona przed nadużyciem)
+    # Przytnij nadmiernie długi tekst
     if len(text) > MAX_TTS_CHARS:
         text = text[:MAX_TTS_CHARS]
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {
-        "xi-api-key": api_key,
-        "Content-Type": "application/json",
-    }
+    headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
     payload = {
         "text": text,
         "model_id": model_id,
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75
-        }
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
     }
 
     r = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
@@ -105,15 +104,15 @@ def synthesize_speech(text: str, voice_id: str = None, model_id: str = None) -> 
 
     return r.content  # MP3 bytes
 
-# ⏳ Wczytaj core beliefs
+# ── Core beliefs ──────────────────────────────────────────────────────────────
 def load_core_beliefs(language="en"):
     try:
         with open(BELIEFS_FILE, "r", encoding="utf-8") as f:
             beliefs_data = json.load(f)
-            beliefs_text = "\n\n".join([
+            beliefs_text = "\n\n".join(
                 f"{belief.get('title','')}: {belief.get('content','')}"
                 for belief in beliefs_data.get("core_beliefs", [])
-            ])
+            )
             if language == "pl":
                 return (
                     "Jesteś Jackiem – wspierającym, pokornym i empatycznym towarzyszem, "
@@ -130,7 +129,7 @@ def load_core_beliefs(language="en"):
         print("❌ Error loading beliefs:", str(e))
         return "You are Jack – a helpful and empathetic assistant."
 
-# ⏺️ Zapis (plik + DB)
+# ── Zapis historii (plik + DB) ───────────────────────────────────────────────
 def save_to_history(user_message, jack_reply, user_id=None, session_id=None):
     history_entry = {"user": user_message, "jack": jack_reply}
     # JSON (lokalny backup)
@@ -147,7 +146,7 @@ def save_to_history(user_message, jack_reply, user_id=None, session_id=None):
                 history.append(history_entry)
                 f.seek(0)
                 json.dump(history, f, ensure_ascii=False, indent=2)
-                f.truncate()  # ważne, by nie zostawić starego "ogona"
+                f.truncate()
     except Exception as e:
         print("⚠️ File save failed:", str(e))
 
@@ -160,8 +159,13 @@ def save_to_history(user_message, jack_reply, user_id=None, session_id=None):
         db.session.rollback()
         print("⚠️ DB save failed:", str(e))
 
-# 🔁 CHAT
-@app.route('/api/jack', methods=['POST'])
+# ── ROUTES ───────────────────────────────────────────────────────────────────
+@app.route("/")
+def home():
+    return "Backend Jack działa 🚀  (sprawdź też /api/health)"
+
+# CHAT
+@app.route("/api/jack", methods=["POST"])
 def chat_with_jack():
     data = request.get_json() or {}
     user_message = data.get("message", "")
@@ -185,9 +189,9 @@ def chat_with_jack():
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
+                {"role": "user", "content": user_message},
             ],
-            temperature=0.7
+            temperature=0.7,
         )
         jack_reply = response.choices[0].message.content
         save_to_history(user_message, jack_reply, user_id=user_id, session_id=session_id)
@@ -199,14 +203,16 @@ def chat_with_jack():
                 audio_bytes = synthesize_speech(
                     text=jack_reply,
                     voice_id=tts_voice_id,
-                    model_id=tts_model_id
+                    model_id=tts_model_id,
                 )
                 audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                result.update({
-                    "audio_b64": audio_b64,
-                    "audio_mime": "audio/mpeg",
-                    "audio_bytes": len(audio_bytes)
-                })
+                result.update(
+                    {
+                        "audio_b64": audio_b64,
+                        "audio_mime": "audio/mpeg",
+                        "audio_bytes": len(audio_bytes),
+                    }
+                )
             except Exception as tts_err:
                 # Nie blokuj odpowiedzi tekstowej:
                 result["tts_error"] = str(tts_err)
@@ -216,8 +222,8 @@ def chat_with_jack():
         print("❌ Backend error:", str(e))
         return jsonify({"error": str(e)}), 500
 
-# 🎙️ TTS endpoint (JSON → base64 lub binarnie)
-@app.route('/api/tts', methods=['POST'])
+# TTS (JSON → base64 lub binarnie)
+@app.route("/api/tts", methods=["POST"])
 def tts():
     """
     body: { text: string, voice_id?: string, model_id?: string, as_base64?: bool }
@@ -237,19 +243,15 @@ def tts():
 
         if as_base64:
             b64 = base64.b64encode(audio_bytes).decode("utf-8")
-            return jsonify({
-                "audio_b64": b64,
-                "mime_type": "audio/mpeg",
-                "length_bytes": len(audio_bytes)
-            })
+            return jsonify({"audio_b64": b64, "mime_type": "audio/mpeg", "length_bytes": len(audio_bytes)})
         else:
             return Response(audio_bytes, mimetype="audio/mpeg")
     except Exception as e:
         print("❌ /api/tts error:", str(e))
         return jsonify({"error": str(e)}), 500
 
-# 🎙️ TTS stream endpoint (zawsze binarne MP3)
-@app.route('/api/tts.stream', methods=['POST'])
+# TTS (binarny stream)
+@app.route("/api/tts.stream", methods=["POST"])
 def tts_stream():
     """
     body: { text: string, voice_id?: string, model_id?: string }
@@ -270,8 +272,8 @@ def tts_stream():
         print("❌ /api/tts.stream error:", str(e))
         return jsonify({"error": str(e)}), 500
 
-# 📥 Ręczne dopisanie wiadomości do historii – przydatne do testów
-@app.route('/api/message', methods=['POST'])
+# Ręczne dopisanie wiadomości do historii – przydatne do testów
+@app.route("/api/message", methods=["POST"])
 def add_message():
     """
     body: { role: 'user'|'jack', content: '...', user_id: 'u1', session_id?: 's1' }
@@ -294,8 +296,8 @@ def add_message():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-# 📜 HISTORIA (per user / per session) + paginacja
-@app.route('/api/history', methods=['GET'])
+# HISTORIA (per user / per session) + paginacja
+@app.route("/api/history", methods=["GET"])
 def get_history():
     """
     Query params:
@@ -307,17 +309,17 @@ def get_history():
       - after_id: zwróć rekordy o id > after_id (prosta paginacja strumieniowa)
     """
     try:
-        user_id = request.args.get('user_id')
-        session_id = request.args.get('session_id')
+        user_id = request.args.get("user_id")
+        session_id = request.args.get("session_id")
 
         if not user_id and not session_id:
             return jsonify({"error": "Provide user_id or session_id"}), 400
 
-        limit = min(int(request.args.get('limit', 100)), 500)
-        order = request.args.get('order', 'asc').lower()
-        since = request.args.get('since')
-        until = request.args.get('until')
-        after_id = request.args.get('after_id', type=int)
+        limit = min(int(request.args.get("limit", 100)), 500)
+        order = request.args.get("order", "asc").lower()
+        since = request.args.get("since")
+        until = request.args.get("until")
+        after_id = request.args.get("after_id", type=int)
 
         q = Message.query
         if user_id:
@@ -342,7 +344,7 @@ def get_history():
         if after_id:
             q = q.filter(Message.id > after_id)
 
-        order_by = Message.timestamp.desc() if order == 'desc' else Message.timestamp.asc()
+        order_by = Message.timestamp.desc() if order == "desc" else Message.timestamp.asc()
         items = q.order_by(order_by).limit(limit).all()
         return jsonify([serialize_message(m) for m in items]), 200
 
@@ -350,12 +352,12 @@ def get_history():
         print("❌ /api/history error:", str(e))
         return jsonify({"error": str(e)}), 500
 
-# 🧹 Wyczyść historię danego użytkownika/sesji (do testów)
-@app.route('/api/history', methods=['DELETE'])
+# Wyczyść historię danego użytkownika/sesji (do testów)
+@app.route("/api/history", methods=["DELETE"])
 def clear_history():
     try:
-        user_id = request.args.get('user_id')
-        session_id = request.args.get('session_id')
+        user_id = request.args.get("user_id")
+        session_id = request.args.get("session_id")
         if not user_id and not session_id:
             return jsonify({"error": "Provide user_id or session_id"}), 400
 
@@ -372,8 +374,8 @@ def clear_history():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-# ❤️ Healthcheck
-@app.route('/api/health', methods=['GET'])
+# Healthcheck
+@app.route("/api/health", methods=["GET"])
 def health():
     try:
         db.session.execute(db.select(Message).limit(1))
@@ -381,11 +383,12 @@ def health():
     except Exception as e:
         return jsonify({"status": "db_error", "error": str(e)}), 500
 
-if __name__ == '__main__':
+# ── Lokalny start ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    # W produkcji użyj gunicorn/uvicorn; lokalnie:
     app.run(port=5000)
+
 
 
 
