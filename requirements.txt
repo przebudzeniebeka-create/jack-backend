@@ -1,8 +1,9 @@
 flask
-flask_sqlalchemy
-flask_cors
+flask-cors
+flask-sqlalchemy
 python-dotenv
+requests
 python-dateutil
 openai
-requests
+gunicorn
 
