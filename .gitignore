@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# wirtualne środowiska
+.venv/
+venv/
+
+# tajne i lokalne
+.env
+.env.*
+app.db
+instance/
+.history/
+.DS_Store

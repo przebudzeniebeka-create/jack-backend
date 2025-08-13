@@ -1,0 +1,8 @@
+flask
+flask_sqlalchemy
+flask_cors
+python-dotenv
+python-dateutil
+openai
+requests
+
