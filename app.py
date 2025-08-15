@@ -1,53 +1,107 @@
-from flask import Flask, request, jsonify, Response
+# app.py
+from __future__ import annotations
+
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
 from openai import OpenAI
-import os
+import os, json, re, time
 from dotenv import load_dotenv
-import json
 from datetime import datetime
 from dateutil import parser as dtparser  # pip install python-dateutil
-import requests
-import base64
+from typing import Optional, Tuple, Dict
+from sqlalchemy import text as sa_text
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Init
+# ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
-
 app = Flask(__name__)
 
-# ── CORS ───────────────────────────────────────────────────────────────────────
-# Produkcyjnie możesz zawęzić do konkretnych domen podając env CORS_ORIGIN="https://jackqs.ai,https://www.jackqs.ai"
-cors_origins = os.getenv("CORS_ORIGIN")
-if cors_origins:
-    origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
-    CORS(app, resources={r"/api/*": {"origins": origins}})
-else:
-    CORS(app)
+# JSON in UTF-8 (no \uXXXX escapes)
+app.config["JSON_AS_ASCII"] = False
+try:
+    app.json.ensure_ascii = False  # Flask >= 2.3
+except Exception:
+    pass
 
-# ── Klucze, DB ────────────────────────────────────────────────────────────────
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Database
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///app.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
-# ── Konfiguracja ──────────────────────────────────────────────────────────────
+# OpenAI
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "4000"))  # limit bezpieczeństwa
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ── Pliki (lokalny backup historii i beliefs) ─────────────────────────────────
+# Local files (simple JSON backups)
 HISTORY_FILE = "history.json"
 BELIEFS_FILE = "core_beliefs.json"
 
-# ── MODELE DB ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CORS (public fronts + localhost; any preview *.jackqs-frontend.pages.dev)
+# ─────────────────────────────────────────────────────────────────────────────
+ALLOWED_ORIGINS = {
+    "https://app.jackqs.ai",
+    "https://jackqs.ai",
+    "https://www.jackqs.ai",
+    "http://localhost:5173",
+}
+PAGES_RE = re.compile(r"^https://[a-z0-9-]+\.jackqs-frontend\.pages\.dev$", re.IGNORECASE)
+
+_env = os.getenv("CORS_ORIGIN", "")
+if _env.strip():
+    ALLOWED_ORIGINS |= {o.strip() for o in _env.split(",") if o.strip()}
+
+def origin_allowed(origin: Optional[str]) -> bool:
+    if not origin:
+        return False
+    return origin in ALLOWED_ORIGINS or bool(PAGES_RE.match(origin))
+
+@app.after_request
+def add_cors(resp):
+    """
+    Add CORS headers for allowed origins and normalize JSON charset.
+    Important: echo Access-Control-Request-* to satisfy preflight even if
+    the frontend sends custom headers.
+    """
+    origin = request.headers.get("Origin")
+    if origin_allowed(origin):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+
+        # Echo what the browser asks for during preflight
+        req_method = request.headers.get("Access-Control-Request-Method")
+        req_headers = request.headers.get("Access-Control-Request-Headers")
+
+        resp.headers["Access-Control-Allow-Methods"] = req_method or "GET, POST, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = req_headers or "Content-Type, Authorization"
+        resp.headers["Access-Control-Expose-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Max-Age"] = "86400"
+
+    # ensure JSON responses declare UTF-8
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    if resp.mimetype == "application/json" and "charset=" not in ct:
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    return resp
+
+# Global preflight for /api/*
+@app.route("/api/<path:_any>", methods=["OPTIONS"])
+def any_api_options(_any):
+    return ("", 204)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Models
+# ─────────────────────────────────────────────────────────────────────────────
 class Message(db.Model):
     __tablename__ = "Message"
-    id = db.Column(db.Integer, primary_key=True)
-    role = db.Column(db.String(10))          # 'user' | 'jack'
-    content = db.Column(db.Text)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    user_id = db.Column(db.String(64), index=True)
+    id         = db.Column(db.Integer, primary_key=True)
+    role       = db.Column(db.String(10))      # 'user' | 'jack'
+    content    = db.Column(db.Text)
+    timestamp  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    user_id    = db.Column(db.String(64), index=True)
     session_id = db.Column(db.String(64), index=True)
 
-def serialize_message(m: "Message"):
+def serialize_message(m: "Message") -> Dict[str, object]:
     return {
         "id": m.id,
         "role": m.role,
@@ -57,135 +111,111 @@ def serialize_message(m: "Message"):
         "session_id": m.session_id,
     }
 
-# ✅ Upewnij się, że tabele powstaną także w produkcji (Railway/gunicorn)
-try:
-    with app.app_context():
-        db.create_all()
-        print("✅ DB tables ensured")
-except Exception as e:
-    print("⚠️ DB init error:", e)
+with app.app_context():
+    db.create_all()
 
-# ── ElevenLabs TTS ───────────────────────────────────────────────────────────
-def synthesize_speech(text: str, voice_id: str = None, model_id: str = None) -> bytes:
-    """
-    Zwraca bajty MP3 z ElevenLabs.
-    Wymaga .env: ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID (domyślnie), ELEVENLABS_MODEL_ID.
-    """
-    api_key = os.getenv("ELEVENLABS_API_KEY")
-    if not api_key:
-        raise RuntimeError("ELEVENLABS_API_KEY not set in environment")
-
-    # Parametry z żądania mają pierwszeństwo, potem .env
-    voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID", "")
-    model_id = model_id or os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
-
-    if not voice_id:
-        raise RuntimeError("VOICE_ID missing: pass `voice_id` in request or set ELEVENLABS_VOICE_ID in .env")
-
-    # Przytnij nadmiernie długi tekst
-    if len(text) > MAX_TTS_CHARS:
-        text = text[:MAX_TTS_CHARS]
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
-    payload = {
-        "text": text,
-        "model_id": model_id,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-    }
-
-    r = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
-    if r.status_code != 200:
-        try:
-            err = r.json()
-        except Exception:
-            err = r.text
-        raise RuntimeError(f"ElevenLabs TTS error ({r.status_code}): {err}")
-
-    return r.content  # MP3 bytes
-
-# ── Core beliefs ──────────────────────────────────────────────────────────────
-def load_core_beliefs(language="en"):
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def load_core_beliefs_en() -> str:
+    """English-only system prompt."""
     try:
         with open(BELIEFS_FILE, "r", encoding="utf-8") as f:
             beliefs_data = json.load(f)
-            beliefs_text = "\n\n".join(
-                f"{belief.get('title','')}: {belief.get('content','')}"
-                for belief in beliefs_data.get("core_beliefs", [])
-            )
-            if language == "pl":
-                return (
-                    "Jesteś Jackiem – wspierającym, pokornym i empatycznym towarzyszem, "
-                    "który widzi świat z perspektywy niedualnej. Oto twoje podstawowe przekonania:\n\n"
-                    f"{beliefs_text}"
-                )
-            else:
-                return (
-                    "You are Jack – a supportive, humble and empathetic companion who "
-                    "sees the world through a non-dual perspective. Here are your core beliefs:\n\n"
-                    f"{beliefs_text}"
-                )
-    except Exception as e:
-        print("❌ Error loading beliefs:", str(e))
+        beliefs_text = "\n\n".join(
+            f"{b.get('title','')}: {b.get('content','')}"
+            for b in beliefs_data.get("core_beliefs", [])
+        )
+        return (
+            "You are Jack – a supportive, humble, and empathetic companion who sees the world "
+            "through a non-dual perspective. Here are your core beliefs:\n\n"
+            f"{beliefs_text}"
+        )
+    except Exception:
         return "You are Jack – a helpful and empathetic assistant."
 
-# ── Zapis historii (plik + DB) ───────────────────────────────────────────────
-def save_to_history(user_message, jack_reply, user_id=None, session_id=None):
-    history_entry = {"user": user_message, "jack": jack_reply}
-    # JSON (lokalny backup)
+def save_to_history(user_message: str, jack_reply: str, user_id: Optional[str], session_id: Optional[str]) -> None:
+    """Persist last exchange to JSON file and DB."""
+    entry = {"user": user_message, "jack": jack_reply}
     try:
         if not os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump([history_entry], f, ensure_ascii=False, indent=2)
+                json.dump([entry], f, ensure_ascii=False, indent=2)
         else:
             with open(HISTORY_FILE, "r+", encoding="utf-8") as f:
                 try:
                     history = json.load(f)
                 except json.JSONDecodeError:
                     history = []
-                history.append(history_entry)
+                history.append(entry)
                 f.seek(0)
                 json.dump(history, f, ensure_ascii=False, indent=2)
                 f.truncate()
-    except Exception as e:
-        print("⚠️ File save failed:", str(e))
+    except Exception:
+        pass
 
-    # DB
     try:
         db.session.add(Message(role="user", content=user_message, user_id=user_id, session_id=session_id))
         db.session.add(Message(role="jack", content=jack_reply, user_id=user_id, session_id=session_id))
         db.session.commit()
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        print("⚠️ DB save failed:", str(e))
 
-# ── ROUTES ───────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Lightweight capacity control (max 100 active users)
+# ─────────────────────────────────────────────────────────────────────────────
+ACTIVE_USERS: Dict[str, float] = {}
+ACTIVE_TTL_SEC = 600  # 10 minutes
+ACTIVE_LIMIT   = 100
+
+def _cleanup_active(now: float) -> None:
+    stale_before = now - ACTIVE_TTL_SEC
+    to_del = [uid for uid, ts in ACTIVE_USERS.items() if ts < stale_before]
+    for uid in to_del:
+        ACTIVE_USERS.pop(uid, None)
+
+def _check_capacity(user_id: str) -> Tuple[bool, Optional[str]]:
+    now = time.time()
+    _cleanup_active(now)
+    if user_id not in ACTIVE_USERS and len(ACTIVE_USERS) >= ACTIVE_LIMIT:
+        return False, "capacity_reached"
+    ACTIVE_USERS[user_id] = now
+    return True, None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/")
 def home():
-    return "Backend Jack działa 🚀  (sprawdź też /api/health)"
+    return "Jack backend is running 🚀  (see /api/health)"
 
-# CHAT
-@app.route("/api/jack", methods=["POST"])
-def chat_with_jack():
-    data = request.get_json() or {}
-    user_message = data.get("message", "")
-    language = data.get("language", "en")
-    user_id = data.get("user_id")        # wymagane w testach 100 osób
-    session_id = data.get("session_id")  # opcjonalnie do rozdzielania sesji
+@app.route("/api/health", methods=["GET"])
+def health():
+    """DB + process health check."""
+    try:
+        db.session.execute(sa_text("SELECT 1"))
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "db_error", "error": str(e)}), 500
 
-    # opcjonalne audio
-    return_audio = bool(data.get("return_audio", False))
-    tts_voice_id = data.get("voice_id")      # override domyślnego głosu
-    tts_model_id = data.get("model_id")      # np. "eleven_multilingual_v2"
+def _chat_handler():
+    data = request.get_json(silent=True) or {}
+    user_message = (data.get("message") or "").strip()
+    user_id      = (data.get("user_id") or "").strip()
+    session_id   = (data.get("session_id") or "").strip() or None
 
     if not user_message:
         return jsonify({"error": "message is required"}), 400
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
 
+    ok, _ = _check_capacity(user_id)
+    if not ok:
+        return jsonify({"error": "capacity reached, please try again in a moment"}), 429
+
     try:
-        system_prompt = load_core_beliefs(language)
-        response = client.chat.completions.create(
+        system_prompt = load_core_beliefs_en()
+        resp = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -193,132 +223,53 @@ def chat_with_jack():
             ],
             temperature=0.7,
         )
-        jack_reply = response.choices[0].message.content
+        jack_reply = resp.choices[0].message.content
         save_to_history(user_message, jack_reply, user_id=user_id, session_id=session_id)
-
-        result = {"reply": jack_reply}
-
-        if return_audio:
-            try:
-                audio_bytes = synthesize_speech(
-                    text=jack_reply,
-                    voice_id=tts_voice_id,
-                    model_id=tts_model_id,
-                )
-                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                result.update(
-                    {
-                        "audio_b64": audio_b64,
-                        "audio_mime": "audio/mpeg",
-                        "audio_bytes": len(audio_bytes),
-                    }
-                )
-            except Exception as tts_err:
-                # Nie blokuj odpowiedzi tekstowej:
-                result["tts_error"] = str(tts_err)
-
-        return jsonify(result)
+        return jsonify({"reply": jack_reply})
     except Exception as e:
-        print("❌ Backend error:", str(e))
         return jsonify({"error": str(e)}), 500
 
-# TTS (JSON → base64 lub binarnie)
-@app.route("/api/tts", methods=["POST"])
-def tts():
-    """
-    body: { text: string, voice_id?: string, model_id?: string, as_base64?: bool }
-    domyślnie zwraca base64 MP3 (JSON).
-    """
-    try:
-        data = request.get_json() or {}
-        text = data.get("text", "")
-        voice_id = data.get("voice_id")
-        model_id = data.get("model_id")
-        as_base64 = data.get("as_base64", True)
+@app.route("/api/jack", methods=["POST"])
+def chat_with_jack():
+    return _chat_handler()
 
-        if not text.strip():
-            return jsonify({"error": "text is required"}), 400
+@app.route("/api/chat", methods=["POST"])
+def chat_alias():
+    return _chat_handler()
 
-        audio_bytes = synthesize_speech(text, voice_id=voice_id, model_id=model_id)
+# History API
+@app.route("/api/history", methods=["GET", "DELETE"])
+def history():
+    if request.method == "DELETE":
+        try:
+            user_id = request.args.get("user_id")
+            session_id = request.args.get("session_id")
+            if not user_id and not session_id:
+                return jsonify({"error": "Provide user_id or session_id"}), 400
 
-        if as_base64:
-            b64 = base64.b64encode(audio_bytes).decode("utf-8")
-            return jsonify({"audio_b64": b64, "mime_type": "audio/mpeg", "length_bytes": len(audio_bytes)})
-        else:
-            return Response(audio_bytes, mimetype="audio/mpeg")
-    except Exception as e:
-        print("❌ /api/tts error:", str(e))
-        return jsonify({"error": str(e)}), 500
+            q = db.session.query(Message)
+            if user_id:
+                q = q.filter(Message.user_id == user_id)
+            if session_id:
+                q = q.filter(Message.session_id == session_id)
 
-# TTS (binarny stream)
-@app.route("/api/tts.stream", methods=["POST"])
-def tts_stream():
-    """
-    body: { text: string, voice_id?: string, model_id?: string }
-    Zwraca binarne audio/mpeg.
-    """
-    try:
-        data = request.get_json() or {}
-        text = data.get("text", "")
-        voice_id = data.get("voice_id")
-        model_id = data.get("model_id")
+            deleted = q.delete(synchronize_session=False)
+            db.session.commit()
+            return jsonify({"status": "ok", "deleted": int(deleted)})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"error": str(e)}), 500
 
-        if not text.strip():
-            return jsonify({"error": "text is required"}), 400
-
-        audio_bytes = synthesize_speech(text, voice_id=voice_id, model_id=model_id)
-        return Response(audio_bytes, mimetype="audio/mpeg")
-    except Exception as e:
-        print("❌ /api/tts.stream error:", str(e))
-        return jsonify({"error": str(e)}), 500
-
-# Ręczne dopisanie wiadomości do historii – przydatne do testów
-@app.route("/api/message", methods=["POST"])
-def add_message():
-    """
-    body: { role: 'user'|'jack', content: '...', user_id: 'u1', session_id?: 's1' }
-    """
-    data = request.get_json() or {}
-    role = data.get("role")
-    content = data.get("content")
-    user_id = data.get("user_id")
-    session_id = data.get("session_id")
-
-    if role not in ("user", "jack") or not content or not user_id:
-        return jsonify({"error": "role, content, user_id are required"}), 400
-
-    try:
-        m = Message(role=role, content=content, user_id=user_id, session_id=session_id)
-        db.session.add(m)
-        db.session.commit()
-        return jsonify(serialize_message(m)), 201
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-
-# HISTORIA (per user / per session) + paginacja
-@app.route("/api/history", methods=["GET"])
-def get_history():
-    """
-    Query params:
-      - user_id: wymagane (albo session_id)
-      - session_id: alternatywnie do user_id
-      - limit: int (domyślnie 100, max 500)
-      - order: 'asc' | 'desc' (domyślnie asc)
-      - since, until: ISO datetime
-      - after_id: zwróć rekordy o id > after_id (prosta paginacja strumieniowa)
-    """
     try:
         user_id = request.args.get("user_id")
         session_id = request.args.get("session_id")
-
         if not user_id and not session_id:
             return jsonify({"error": "Provide user_id or session_id"}), 400
 
-        limit = min(int(request.args.get("limit", 100)), 500)
-        order = request.args.get("order", "asc").lower()
-        since = request.args.get("since")
-        until = request.args.get("until")
+        limit    = min(int(request.args.get("limit", 100)), 500)
+        order    = request.args.get("order", "asc").lower()
+        since    = request.args.get("since")
+        until    = request.args.get("until")
         after_id = request.args.get("after_id", type=int)
 
         q = Message.query
@@ -326,68 +277,42 @@ def get_history():
             q = q.filter(Message.user_id == user_id)
         if session_id:
             q = q.filter(Message.session_id == session_id)
-
         if since:
             try:
-                dt = dtparser.isoparse(since)
-                q = q.filter(Message.timestamp >= dt)
+                q = q.filter(Message.timestamp >= dtparser.isoparse(since))
             except Exception:
-                return jsonify({"error": "Invalid 'since' datetime format. Use ISO 8601."}), 400
-
+                return jsonify({"error": "Invalid 'since' datetime. Use ISO 8601."}), 400
         if until:
             try:
-                dt = dtparser.isoparse(until)
-                q = q.filter(Message.timestamp <= dt)
+                q = q.filter(Message.timestamp <= dtparser.isoparse(until))
             except Exception:
-                return jsonify({"error": "Invalid 'until' datetime format. Use ISO 8601."}), 400
-
+                return jsonify({"error": "Invalid 'until' datetime. Use ISO 8601."}), 400
         if after_id:
             q = q.filter(Message.id > after_id)
 
         order_by = Message.timestamp.desc() if order == "desc" else Message.timestamp.asc()
         items = q.order_by(order_by).limit(limit).all()
-        return jsonify([serialize_message(m) for m in items]), 200
-
+        return jsonify([serialize_message(m) for m in items])
     except Exception as e:
-        print("❌ /api/history error:", str(e))
         return jsonify({"error": str(e)}), 500
 
-# Wyczyść historię danego użytkownika/sesji (do testów)
-@app.route("/api/history", methods=["DELETE"])
-def clear_history():
-    try:
-        user_id = request.args.get("user_id")
-        session_id = request.args.get("session_id")
-        if not user_id and not session_id:
-            return jsonify({"error": "Provide user_id or session_id"}), 400
-
-        q = db.session.query(Message)
-        if user_id:
-            q = q.filter(Message.user_id == user_id)
-        if session_id:
-            q = q.filter(Message.session_id == session_id)
-
-        deleted = q.delete(synchronize_session=False)
-        db.session.commit()
-        return jsonify({"status": "ok", "deleted": int(deleted)})
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-
-# Healthcheck
-@app.route("/api/health", methods=["GET"])
-def health():
-    try:
-        db.session.execute(db.select(Message).limit(1))
-        return jsonify({"status": "ok"})
-    except Exception as e:
-        return jsonify({"status": "db_error", "error": str(e)}), 500
-
-# ── Lokalny start ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Local run
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    app.run(port=5000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
+
+
+
+
+
+
+
+
+
 
 
 
