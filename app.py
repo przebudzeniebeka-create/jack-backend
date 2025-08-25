@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
 from openai import OpenAI
 import os, json, re, time
 from dotenv import load_dotenv
@@ -15,20 +16,7 @@ from sqlalchemy import text as sa_text
 # Init
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
-from flask_cors import CORS
 app = Flask(__name__)
-CORS(
-    app,
-    resources={r"/api/*": {"origins": [
-        "https://jackqs.ai",
-        "https://*.jackqs.ai",
-        "https://jackqs-frontend.pages.dev",
-        "https://*.pages.dev"
-    ]}},
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-    max_age=86400
-)
 
 # JSON in UTF-8 (no \uXXXX escapes)
 app.config["JSON_AS_ASCII"] = False
@@ -51,8 +39,22 @@ HISTORY_FILE = "history.json"
 BELIEFS_FILE = "core_beliefs.json"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORS (public fronts + localhost; any preview *.jackqs-frontend.pages.dev)
+# CORS (Cloudflare Pages, własne domeny i localhost)
 # ─────────────────────────────────────────────────────────────────────────────
+CORS(
+    app,
+    resources={r"/api/*": {"origins": [
+        "https://jackqs.ai",
+        "https://*.jackqs.ai",
+        "https://jackqs-frontend.pages.dev",
+        "https://*.pages.dev",
+        "http://localhost:5173",
+    ]}},
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=86400,
+)
+
 ALLOWED_ORIGINS = {
     "https://app.jackqs.ai",
     "https://jackqs.ai",
@@ -72,32 +74,25 @@ def origin_allowed(origin: Optional[str]) -> bool:
 
 @app.after_request
 def add_cors(resp):
-    """
-    Add CORS headers for allowed origins and normalize JSON charset.
-    Important: echo Access-Control-Request-* to satisfy preflight even if
-    the frontend sends custom headers.
-    """
+    # Doprecyzowanie nagłówków i charset dla JSON
     origin = request.headers.get("Origin")
     if origin_allowed(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
 
-        # Echo what the browser asks for during preflight
         req_method = request.headers.get("Access-Control-Request-Method")
         req_headers = request.headers.get("Access-Control-Request-Headers")
-
-        resp.headers["Access-Control-Allow-Methods"] = req_method or "GET, POST, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = req_method or "GET, POST, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = req_headers or "Content-Type, Authorization"
         resp.headers["Access-Control-Expose-Headers"] = "Content-Type"
         resp.headers["Access-Control-Max-Age"] = "86400"
 
-    # ensure JSON responses declare UTF-8
     ct = (resp.headers.get("Content-Type") or "").lower()
     if resp.mimetype == "application/json" and "charset=" not in ct:
         resp.headers["Content-Type"] = "application/json; charset=utf-8"
     return resp
 
-# Global preflight for /api/*
+# Global preflight dla dowolnego /api/*
 @app.route("/api/<path:_any>", methods=["OPTIONS"])
 def any_api_options(_any):
     return ("", 204)
@@ -148,8 +143,8 @@ def load_core_beliefs_en() -> str:
         return "You are Jack – a helpful and empathetic assistant."
 
 def save_to_history(user_message: str, jack_reply: str, user_id: Optional[str], session_id: Optional[str]) -> None:
-    """Persist last exchange to JSON file and DB."""
     entry = {"user": user_message, "jack": jack_reply}
+    # JSON backup
     try:
         if not os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
@@ -166,7 +161,7 @@ def save_to_history(user_message: str, jack_reply: str, user_id: Optional[str], 
                 f.truncate()
     except Exception:
         pass
-
+    # DB
     try:
         db.session.add(Message(role="user", content=user_message, user_id=user_id, session_id=session_id))
         db.session.add(Message(role="jack", content=jack_reply, user_id=user_id, session_id=session_id))
@@ -175,7 +170,7 @@ def save_to_history(user_message: str, jack_reply: str, user_id: Optional[str], 
         db.session.rollback()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lightweight capacity control (max 100 active users)
+# Lightweight capacity control
 # ─────────────────────────────────────────────────────────────────────────────
 ACTIVE_USERS: Dict[str, float] = {}
 ACTIVE_TTL_SEC = 600  # 10 minutes
@@ -183,8 +178,7 @@ ACTIVE_LIMIT   = 100
 
 def _cleanup_active(now: float) -> None:
     stale_before = now - ACTIVE_TTL_SEC
-    to_del = [uid for uid, ts in ACTIVE_USERS.items() if ts < stale_before]
-    for uid in to_del:
+    for uid in [u for u, ts in ACTIVE_USERS.items() if ts < stale_before]:
         ACTIVE_USERS.pop(uid, None)
 
 def _check_capacity(user_id: str) -> Tuple[bool, Optional[str]]:
@@ -202,25 +196,51 @@ def _check_capacity(user_id: str) -> Tuple[bool, Optional[str]]:
 def home():
     return "Jack backend is running 🚀  (see /api/health)"
 
-@app.route("/api/health", methods=["GET"])
+@app.route("/api/health", methods=["GET", "OPTIONS"])
 def health():
-    """DB + process health check."""
     try:
         db.session.execute(sa_text("SELECT 1"))
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"status": "db_error", "error": str(e)}), 500
 
+def _get_param(data: dict, key: str) -> Optional[str]:
+    """Prefer JSON, then query, then form; zwróć przycięty string."""
+    v = data.get(key)
+    if v is None:
+        v = request.args.get(key)
+    if v is None:
+        v = request.form.get(key)
+    if isinstance(v, str):
+        return v.strip()
+    return v
+
+def _extract_message(data: dict) -> Optional[str]:
+    msg = _get_param(data, "message")
+    if msg:
+        return msg
+    # delikatne fallbacki na inne nazwy
+    for k in ("text", "prompt", "query", "q"):
+        v = _get_param(data, k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # jeśli JSON zawiera 1 sensowne pole tekstowe – użyj go
+    if data:
+        for k, v in data.items():
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
 def _chat_handler():
     data = request.get_json(silent=True) or {}
-    user_message = (data.get("message") or "").strip()
-    user_id      = (data.get("user_id") or "").strip()
-    session_id   = (data.get("session_id") or "").strip() or None
+    user_message = _extract_message(data) or ""
+    user_id      = (_get_param(data, "user_id") or "")  # JSON albo ?user_id=...
+    session_id   = (_get_param(data, "session_id") or None)
 
-    if not user_message:
-        return jsonify({"error": "message is required"}), 400
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
+    if not user_message:
+        return jsonify({"error": "message is required"}), 400
 
     ok, _ = _check_capacity(user_id)
     if not ok:
@@ -242,17 +262,20 @@ def _chat_handler():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/jack", methods=["POST"])
+@app.route("/api/jack", methods=["POST", "GET", "OPTIONS"])
 def chat_with_jack():
     return _chat_handler()
 
-@app.route("/api/chat", methods=["POST"])
+@app.route("/api/chat", methods=["POST", "GET", "OPTIONS"])
 def chat_alias():
     return _chat_handler()
 
 # History API
-@app.route("/api/history", methods=["GET", "DELETE"])
+@app.route("/api/history", methods=["GET", "DELETE", "OPTIONS"])
 def history():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     if request.method == "DELETE":
         try:
             user_id = request.args.get("user_id")
@@ -316,6 +339,7 @@ if __name__ == "__main__":
     with app.app_context():
         db.create_all()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
 
 
 
