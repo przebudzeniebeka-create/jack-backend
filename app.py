@@ -15,7 +15,20 @@ from sqlalchemy import text as sa_text
 # Init
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
+from flask_cors import CORS
 app = Flask(__name__)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": [
+        "https://jackqs.ai",
+        "https://*.jackqs.ai",
+        "https://jackqs-frontend.pages.dev",
+        "https://*.pages.dev"
+    ]}},
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=86400
+)
 
 # JSON in UTF-8 (no \uXXXX escapes)
 app.config["JSON_AS_ASCII"] = False
