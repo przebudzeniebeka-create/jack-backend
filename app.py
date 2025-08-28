@@ -1,27 +1,27 @@
 # app.py
 from __future__ import annotations
 
+import os, json, re, time, requests
+from typing import Optional, Tuple, Dict
+from datetime import datetime
+
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from openai import OpenAI
-import os, json, re, time
-from dotenv import load_dotenv
-from datetime import datetime
-from dateutil import parser as dtparser  # pip install python-dateutil
-from typing import Optional, Tuple, Dict
 from sqlalchemy import text as sa_text
+from dotenv import load_dotenv
+from dateutil import parser as dtparser
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Init
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 load_dotenv()
 app = Flask(__name__)
 
-# JSON in UTF-8 (no \uXXXX escapes)
+# JSON UTF-8
 app.config["JSON_AS_ASCII"] = False
 try:
-    app.json.ensure_ascii = False  # Flask >= 2.3
+    app.json.ensure_ascii = False
 except Exception:
     pass
 
@@ -30,42 +30,47 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///app
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
-# OpenAI
+# OpenAI (używasz w /api/chat)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+from openai import OpenAI
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Local files (simple JSON backups)
+# Pliki lokalne
 HISTORY_FILE = "history.json"
 BELIEFS_FILE = "core_beliefs.json"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CORS (Cloudflare Pages, własne domeny i localhost)
-# ─────────────────────────────────────────────────────────────────────────────
+# Turnstile
+TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET_KEY", "")
+print("Turnstile secret configured:", bool(TURNSTILE_SECRET))
+
+# Dev: pozwól obejść Turnstile lokalnie (domyślnie włączone)
+BYPASS_TURNSTILE_DEV = os.getenv("BYPASS_TURNSTILE_DEV", "1") == "1"
+
+# -----------------------------------------------------------------------------
+# CORS
+# -----------------------------------------------------------------------------
 CORS(
     app,
     resources={r"/api/*": {"origins": [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://*.pages.dev",
         "https://jackqs.ai",
         "https://*.jackqs.ai",
-        "https://jackqs-frontend.pages.dev",
-        "https://*.pages.dev",
-        "http://localhost:5173",
     ]}},
-    methods=["GET", "POST", "OPTIONS"],
+    methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     max_age=86400,
 )
 
 ALLOWED_ORIGINS = {
-    "https://app.jackqs.ai",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
     "https://jackqs.ai",
     "https://www.jackqs.ai",
-    "http://localhost:5173",
+    "https://app.jackqs.ai",
 }
 PAGES_RE = re.compile(r"^https://[a-z0-9-]+\.jackqs-frontend\.pages\.dev$", re.IGNORECASE)
-
-_env = os.getenv("CORS_ORIGIN", "")
-if _env.strip():
-    ALLOWED_ORIGINS |= {o.strip() for o in _env.split(",") if o.strip()}
 
 def origin_allowed(origin: Optional[str]) -> bool:
     if not origin:
@@ -74,32 +79,28 @@ def origin_allowed(origin: Optional[str]) -> bool:
 
 @app.after_request
 def add_cors(resp):
-    # Doprecyzowanie nagłówków i charset dla JSON
     origin = request.headers.get("Origin")
     if origin_allowed(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
-
         req_method = request.headers.get("Access-Control-Request-Method")
         req_headers = request.headers.get("Access-Control-Request-Headers")
-        resp.headers["Access-Control-Allow-Methods"] = req_method or "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = req_method or "GET, POST, DELETE, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = req_headers or "Content-Type, Authorization"
         resp.headers["Access-Control-Expose-Headers"] = "Content-Type"
         resp.headers["Access-Control-Max-Age"] = "86400"
-
     ct = (resp.headers.get("Content-Type") or "").lower()
     if resp.mimetype == "application/json" and "charset=" not in ct:
         resp.headers["Content-Type"] = "application/json; charset=utf-8"
     return resp
 
-# Global preflight dla dowolnego /api/*
 @app.route("/api/<path:_any>", methods=["OPTIONS"])
 def any_api_options(_any):
     return ("", 204)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Models
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class Message(db.Model):
     __tablename__ = "Message"
     id         = db.Column(db.Integer, primary_key=True)
@@ -122,11 +123,10 @@ def serialize_message(m: "Message") -> Dict[str, object]:
 with app.app_context():
     db.create_all()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def load_core_beliefs_en() -> str:
-    """English-only system prompt."""
     try:
         with open(BELIEFS_FILE, "r", encoding="utf-8") as f:
             beliefs_data = json.load(f)
@@ -144,7 +144,6 @@ def load_core_beliefs_en() -> str:
 
 def save_to_history(user_message: str, jack_reply: str, user_id: Optional[str], session_id: Optional[str]) -> None:
     entry = {"user": user_message, "jack": jack_reply}
-    # JSON backup
     try:
         if not os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
@@ -161,7 +160,6 @@ def save_to_history(user_message: str, jack_reply: str, user_id: Optional[str], 
                 f.truncate()
     except Exception:
         pass
-    # DB
     try:
         db.session.add(Message(role="user", content=user_message, user_id=user_id, session_id=session_id))
         db.session.add(Message(role="jack", content=jack_reply, user_id=user_id, session_id=session_id))
@@ -169,11 +167,34 @@ def save_to_history(user_message: str, jack_reply: str, user_id: Optional[str], 
     except Exception:
         db.session.rollback()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# Turnstile verify
+def _dev_bypass_turnstile() -> bool:
+    if not BYPASS_TURNSTILE_DEV:
+        return False
+    host = (request.host or "").split(":")[0]
+    return host in ("127.0.0.1", "localhost")
+
+def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> tuple[bool, dict]:
+    if _dev_bypass_turnstile():
+        return True, {"dev": "bypass"}
+    if not token or not TURNSTILE_SECRET:
+        return False, {"error": "missing_token_or_secret"}
+    try:
+        resp = requests.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data={"secret": TURNSTILE_SECRET, "response": token, "remoteip": remote_ip or ""},
+            timeout=4,
+        )
+        data = resp.json()
+        return bool(data.get("success")), data
+    except Exception as e:
+        return False, {"error": str(e)}
+
+# -----------------------------------------------------------------------------
 # Lightweight capacity control
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 ACTIVE_USERS: Dict[str, float] = {}
-ACTIVE_TTL_SEC = 600  # 10 minutes
+ACTIVE_TTL_SEC = 600
 ACTIVE_LIMIT   = 100
 
 def _cleanup_active(now: float) -> None:
@@ -189,12 +210,12 @@ def _check_capacity(user_id: str) -> Tuple[bool, Optional[str]]:
     ACTIVE_USERS[user_id] = now
     return True, None
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Routes
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 @app.route("/")
 def home():
-    return "Jack backend is running 🚀  (see /api/health)"
+    return "Jack backend is running (see /api/health)"
 
 @app.route("/api/health", methods=["GET", "OPTIONS"])
 def health():
@@ -205,7 +226,6 @@ def health():
         return jsonify({"status": "db_error", "error": str(e)}), 500
 
 def _get_param(data: dict, key: str) -> Optional[str]:
-    """Prefer JSON, then query, then form; zwróć przycięty string."""
     v = data.get(key)
     if v is None:
         v = request.args.get(key)
@@ -219,26 +239,40 @@ def _extract_message(data: dict) -> Optional[str]:
     msg = _get_param(data, "message")
     if msg:
         return msg
-    # delikatne fallbacki na inne nazwy
     for k in ("text", "prompt", "query", "q"):
         v = _get_param(data, k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    # jeśli JSON zawiera 1 sensowne pole tekstowe – użyj go
     if data:
         for k, v in data.items():
             if isinstance(v, str) and v.strip():
                 return v.strip()
     return None
 
-def _chat_handler():
+def _fallback_user_id() -> str:
+    ip = request.headers.get("CF-Connecting-IP") or request.remote_addr or "anon"
+    return f"ip-{ip}"
+
+# Chat
+@app.route("/api/chat", methods=["POST", "GET", "OPTIONS"])
+@app.route("/api/jack", methods=["POST", "GET", "OPTIONS"])
+def chat_handler():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     data = request.get_json(silent=True) or {}
+
+    # Turnstile (wymagane poza trybem dev-bypass)
+    ts_token = data.get("cf_turnstile_token") or _get_param(data, "cf_turnstile_token")
+    ok_ts, details = verify_turnstile(ts_token, request.remote_addr)
+    print("Turnstile verify (chat):", "OK" if ok_ts else "FAIL", details.get("error"), details.get("messages"))
+    if not ok_ts:
+        return jsonify({"ok": False, "error": "turnstile_failed", "details": details}), 403
+
     user_message = _extract_message(data) or ""
-    user_id      = (_get_param(data, "user_id") or "")  # JSON albo ?user_id=...
+    user_id      = (_get_param(data, "user_id") or request.headers.get("X-User-Id") or _fallback_user_id())
     session_id   = (_get_param(data, "session_id") or None)
 
-    if not user_id:
-        return jsonify({"error": "user_id is required"}), 400
     if not user_message:
         return jsonify({"error": "message is required"}), 400
 
@@ -262,15 +296,63 @@ def _chat_handler():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/jack", methods=["POST", "GET", "OPTIONS"])
-def chat_with_jack():
-    return _chat_handler()
+# ------------------------------- TTS (ElevenLabs) -------------------------------
+def _voice_id_for_lang(lang: str) -> str:
+    lang = (lang or "en").lower()
+    if lang.startswith("pl"):
+        return os.getenv("ELEVENLABS_VOICE_ID_PL") or os.getenv("ELEVENLABS_VOICE_ID") or os.getenv("ELEVENLABS_VOICE_ID_EN") or ""
+    else:
+        return os.getenv("ELEVENLABS_VOICE_ID_EN") or os.getenv("ELEVENLABS_VOICE_ID") or ""
 
-@app.route("/api/chat", methods=["POST", "GET", "OPTIONS"])
-def chat_alias():
-    return _chat_handler()
+@app.route("/api/tts", methods=["POST", "OPTIONS"])
+def tts():
+    if request.method == "OPTIONS":
+        return ("", 204)
 
-# History API
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    lang = (data.get("lang") or "en").strip()
+
+    # Turnstile
+    ts_token = data.get("cf_turnstile_token") or request.headers.get("X-CF-Turnstile")
+    ok_ts, details = verify_turnstile(ts_token, request.remote_addr)
+    print("Turnstile verify (tts):", "OK" if ok_ts else "FAIL", details.get("error"), details.get("messages"))
+    if not ok_ts:
+        return jsonify({"ok": False, "error": "turnstile_failed", "details": details}), 403
+
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    api_key = os.getenv("ELEVENLABS_API_KEY", "")
+    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+    voice_id = _voice_id_for_lang(lang)
+    if not api_key or not voice_id:
+        return jsonify({"error": "missing_elevenlabs_key_or_voice_id"}), 500
+
+    try:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?optimize_streaming_latency=2"
+        payload = {
+            "text": text,
+            "model_id": model_id,
+            "voice_settings": {"stability": 0.4, "similarity_boost": 0.9},
+        }
+        headers = {
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        }
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        if r.status_code != 200:
+            return jsonify({"error": "elevenlabs_error", "status": r.status_code, "body": r.text}), 502
+
+        from flask import Response
+        resp = Response(r.content, mimetype="audio/mpeg")
+        resp.headers["Content-Disposition"] = "inline; filename=tts.mp3"
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ------------------------------- History -------------------------------
 @app.route("/api/history", methods=["GET", "DELETE", "OPTIONS"])
 def history():
     if request.method == "OPTIONS":
@@ -282,13 +364,11 @@ def history():
             session_id = request.args.get("session_id")
             if not user_id and not session_id:
                 return jsonify({"error": "Provide user_id or session_id"}), 400
-
             q = db.session.query(Message)
             if user_id:
                 q = q.filter(Message.user_id == user_id)
             if session_id:
                 q = q.filter(Message.session_id == session_id)
-
             deleted = q.delete(synchronize_session=False)
             db.session.commit()
             return jsonify({"status": "ok", "deleted": int(deleted)})
@@ -301,13 +381,11 @@ def history():
         session_id = request.args.get("session_id")
         if not user_id and not session_id:
             return jsonify({"error": "Provide user_id or session_id"}), 400
-
         limit    = min(int(request.args.get("limit", 100)), 500)
         order    = request.args.get("order", "asc").lower()
         since    = request.args.get("since")
         until    = request.args.get("until")
         after_id = request.args.get("after_id", type=int)
-
         q = Message.query
         if user_id:
             q = q.filter(Message.user_id == user_id)
@@ -325,20 +403,19 @@ def history():
                 return jsonify({"error": "Invalid 'until' datetime. Use ISO 8601."}), 400
         if after_id:
             q = q.filter(Message.id > after_id)
-
         order_by = Message.timestamp.desc() if order == "desc" else Message.timestamp.asc()
         items = q.order_by(order_by).limit(limit).all()
         return jsonify([serialize_message(m) for m in items])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Local run
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
 
 
 

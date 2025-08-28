@@ -10,6 +10,7 @@ venv/
 # tajne i lokalne
 .env
 .env.*
+*.env
 app.db
 instance/
 .history/
