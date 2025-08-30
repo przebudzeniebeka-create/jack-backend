@@ -10,14 +10,17 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . /app
 
-# Prosty healthcheck (Railway też pingnie /api/health)
+# Prosty healthcheck - używa PORT z env
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD python - <<'PY' || exit 1
-import urllib.request,sys
+import os, urllib.request, sys
+port = os.environ.get("PORT", "8000")
 try:
-    urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=3)
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=3)
 except Exception:
     sys.exit(1)
 PY
 
-CMD ["gunicorn","-w","4","-k","gthread","-t","120","-b","0.0.0.0:8000","app:app","--access-logfile","-"]
+# Uruchom gunicorn, nasłuchuj na $PORT (domyślnie 8000)
+CMD ["sh","-lc","gunicorn -w 4 -k gthread -t 120 -b 0.0.0.0:${PORT:-8000} app:app --access-logfile -"]
+
