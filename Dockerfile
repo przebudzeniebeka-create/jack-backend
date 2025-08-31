@@ -1,3 +1,4 @@
+# bust-cache: 2025-08-31-0959
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
