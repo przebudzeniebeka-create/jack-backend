@@ -9,3 +9,4 @@ openai>=1
 
 
 
+Flask-Cors
