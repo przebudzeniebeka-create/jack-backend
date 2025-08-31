@@ -4,11 +4,13 @@ from __future__ import annotations
 import os
 import sys
 import importlib
-from typing import Optional
+from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
+from sqlalchemy import text as sa_text
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DB handle (initialized later inside create_app)
@@ -17,18 +19,45 @@ db = SQLAlchemy()
 
 
 def _normalize_db_url(url: Optional[str]) -> Optional[str]:
-    """Ensure SQLAlchemy-friendly URL (e.g., postgres -> postgresql+psycopg2)."""
+    """
+    Make the URL SQLAlchemy/psycopg2 friendly and force SSL.
+    - postgres:// -> postgresql+psycopg2://
+    - ensure ?sslmode=require (or PGSSLMODE if set)
+    """
     if not url:
         return None
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+
+    try:
+        parsed = urlparse(url)
+        q = dict(parse_qsl(parsed.query))
+        if "sslmode" not in q:
+            q["sslmode"] = os.getenv("PGSSLMODE", "require")
+        new_query = urlencode(q)
+        url = urlunparse(parsed._replace(query=new_query))
+    except Exception:
+        pass
+
     return url
+
+
+def _collect_routes(flask_app: Flask) -> List[Dict[str, Any]]:
+    routes: List[Dict[str, Any]] = []
+    for rule in flask_app.url_map.iter_rules():
+        routes.append({
+            "rule": str(rule),
+            "endpoint": rule.endpoint,
+            "methods": sorted(m for m in rule.methods if m not in {"HEAD", "OPTIONS"}),
+        })
+    routes.sort(key=lambda r: r["rule"])
+    return routes
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # ── Config: Database
+    # ── Config: Database URL
     db_url = (
         os.getenv("DATABASE_URL")
         or os.getenv("SUPABASE_DB_URL")
@@ -44,7 +73,22 @@ def create_app() -> Flask:
 
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-    # ── CORS (open; adjust origins later if you want)
+    # ── Engine options to keep connections healthy
+    engine_opts = {
+        "pool_pre_ping": True,
+        "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "300")),
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "2")),
+        "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "30")),
+    }
+    connect_args = {}
+    if (db_url or "").startswith("postgresql+psycopg2://"):
+        connect_args["sslmode"] = os.getenv("PGSSLMODE", "require")
+    if connect_args:
+        engine_opts["connect_args"] = connect_args
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_opts
+
+    # ── CORS
     CORS(app, resources={r"/*": {"origins": "*"}})
 
     # ── Init DB
@@ -57,20 +101,39 @@ def create_app() -> Flask:
 
     @app.get("/api/health")
     def health():
-        return jsonify({
+        info = {
             "ok": True,
-            "db": "configured" if db_url else "sqlite-fallback",
             "warn": app.config.get("DB_WARN"),
             "legacy": app.config.get("LEGACY_STATUS", "not-mounted"),
-            "legacy_error": app.config.get("LEGACY_ERROR"),
-        }), 200
+        }
+        if not db_url:
+            info["db"] = "sqlite-fallback"
+            return jsonify(info), 200
 
-    @app.get("/api/version")
-    def version():
-        return jsonify({
-            "version": os.getenv("APP_VERSION", "0.1.0"),
-            "python": sys.version.split()[0]
-        }), 200
+        try:
+            with db.engine.connect() as conn:
+                conn.execute(sa_text("SELECT 1"))
+            info["db"] = "ok"
+        except Exception as e:
+            info["db"] = "error"
+            info["error"] = f"{e.__class__.__name__}: {e}"
+            return jsonify(info), 200
+
+        return jsonify(info), 200
+
+    # New: list routes (main + legacy if mounted)
+    @app.get("/api/routes")
+    def routes():
+        data = {"main": _collect_routes(app)}
+        legacy_app = app.config.get("LEGACY_APP_REF")
+        if legacy_app is not None:
+            try:
+                data["legacy"] = _collect_routes(legacy_app)  # type: ignore[arg-type]
+            except Exception as e:
+                data["legacy_error"] = f"{e.__class__.__name__}: {e}"
+        else:
+            data["legacy"] = []
+        return jsonify(data), 200
 
     # ── Try to mount legacy app (from app_legacy.py) under /legacy
     try:
@@ -80,12 +143,10 @@ def create_app() -> Flask:
             legacy_app = legacy_mod.create_app()
 
         if legacy_app is not None:
-            # Mount legacy as a sub-application
             from werkzeug.middleware.dispatcher import DispatcherMiddleware
-            app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {
-                "/legacy": legacy_app
-            })
+            app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/legacy": legacy_app})
             app.config["LEGACY_STATUS"] = "mounted"
+            app.config["LEGACY_APP_REF"] = legacy_app
         else:
             app.config["LEGACY_STATUS"] = "not-found"
     except Exception as e:
