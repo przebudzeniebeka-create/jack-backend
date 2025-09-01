@@ -28,8 +28,7 @@ BUILD = {
 }
 
 # ──────────────────────── Database ───────────────────────
-# Railway: DATABASE_URL=postgresql+psycopg2://...?...sslmode=require
-db_url = os.getenv("DATABASE_URL", "sqlite:///app.db")
+db_url = os.getenv("DATABASE_URL", "sqlite:///app.db")  # Railway: postgresql+psycopg2://...?...sslmode=require
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
@@ -39,7 +38,7 @@ def _db_scheme_info(uri: str) -> Dict[str, str]:
     kind = "postgres" if "postgres" in scheme else ("sqlite" if "sqlite" in scheme else scheme)
     return {"kind": kind, "scheme": scheme}
 
-# ✅ UPROSZCZENIE: używamy małej litery „message”, bez cudzysłowu (bezpieczne w Postgresie i SQLite).
+# ORM używa małoliterowej tabeli `message` (bez cudzysłowów)
 class Message(db.Model):
     __tablename__ = "message"
     id         = db.Column(db.Integer, primary_key=True)
@@ -49,28 +48,48 @@ class Message(db.Model):
     user_id    = db.Column(db.String(64), index=True)
     session_id = db.Column(db.String(64), index=True)
 
-# Twarda migracja — tworzy tabelę „message”, jeżeli brakuje.
 def ensure_schema() -> None:
+    """
+    - Tworzy public.message, jeśli nie ma.
+    - Dodaje kolumny user_id/session_id, jeśli brakuje (ALTER TABLE IF NOT EXISTS).
+    - Zakłada indeksy.
+    - Jeśli istnieje stara public."Message" a nie istnieje public.message → tworzy message i kopiuje dane.
+    """
     try:
         if "postgres" in db_url:
-            # sprawdź istnienie public.message
-            res = db.session.execute(sa_text("SELECT to_regclass('public.message');"))
-            exists = res.scalar()
-            if not exists:
+            # Sprawdź istnienie tabel
+            exists_message = db.session.execute(sa_text("SELECT to_regclass('public.message');")).scalar()
+            exists_Message = db.session.execute(sa_text("SELECT to_regclass('public.\"Message\"');")).scalar()
+
+            if not exists_message:
                 db.session.execute(sa_text("""
                     CREATE TABLE IF NOT EXISTS public.message (
                         id BIGSERIAL PRIMARY KEY,
                         role VARCHAR(10),
                         content TEXT,
-                        timestamp TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-                        user_id VARCHAR(64),
-                        session_id VARCHAR(64)
+                        timestamp TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
                     );
                 """))
-                db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_ts ON public.message(timestamp);"))
-                db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_user ON public.message(user_id);"))
-                db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_session ON public.message(session_id);"))
+                # Jeśli mamy starą "Message" → skopiuj (bez id, pozwól na nowe)
+                if exists_Message:
+                    db.session.execute(sa_text("""
+                        INSERT INTO public.message (role, content, timestamp)
+                        SELECT role, content, timestamp FROM public."Message";
+                    """))
                 db.session.commit()
+                exists_message = True  # już jest
+
+            # Dodaj brakujące kolumny (bezpiecznie)
+            db.session.execute(sa_text('ALTER TABLE public.message ADD COLUMN IF NOT EXISTS user_id VARCHAR(64);'))
+            db.session.execute(sa_text('ALTER TABLE public.message ADD COLUMN IF NOT EXISTS session_id VARCHAR(64);'))
+
+            # Indeksy (bezpiecznie)
+            db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_ts ON public.message(timestamp);'))
+            db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_user ON public.message(user_id);'))
+            db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_session ON public.message(session_id);'))
+
+            db.session.commit()
+
         else:
             # SQLite
             db.session.execute(sa_text("""
@@ -78,15 +97,16 @@ def ensure_schema() -> None:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     role TEXT,
                     content TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    user_id TEXT,
-                    session_id TEXT
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
             """))
-            db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_ts ON message(timestamp);"))
-            db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_user ON message(user_id);"))
-            db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id);"))
+            db.session.execute(sa_text('ALTER TABLE message ADD COLUMN IF NOT EXISTS user_id TEXT;'))
+            db.session.execute(sa_text('ALTER TABLE message ADD COLUMN IF NOT EXISTS session_id TEXT;'))
+            db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_ts ON message(timestamp);'))
+            db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_user ON message(user_id);'))
+            db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id);'))
             db.session.commit()
+
     except Exception as e:
         db.session.rollback()
         print(f"[schema][ERROR] {e}\n{traceback.format_exc()}")
@@ -102,7 +122,7 @@ def serialize_message(m: "Message") -> Dict[str, object]:
     }
 
 # ───────────────────────── CORS ─────────────────────────
-CORS(app, resources={r"/api/*": {"origins": "*"}})  # zawęzimy po testach
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # zawęzimy później
 
 # ─────────────────────── Turnstile ───────────────────────
 TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET_KEY", "")
@@ -168,28 +188,29 @@ def health():
         "build": BUILD
     })
 
-@app.route("/api/db-ping")
-def db_ping():
-    try:
-        db.session.execute(sa_text("SELECT 1"))
-        return jsonify({"db": "ok"})
-    except Exception as e:
-        return jsonify({"db": "error", "error": str(e)}), 500
-
 @app.route("/api/db-debug")
 def db_debug():
-    """Prosty podgląd tabel i liczników — pomaga przy 500-kach."""
-    out = {"kind": _db_scheme_info(db_url)["kind"], "tables": []}
+    out = {"kind": _db_scheme_info(db_url)["kind"], "tables": [], "message_columns": []}
     try:
         if "postgres" in db_url:
-            rows = db.session.execute(sa_text("SELECT schemaname, tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename;")).fetchall()
+            rows = db.session.execute(sa_text("""
+                SELECT schemaname, tablename FROM pg_tables
+                WHERE schemaname='public' ORDER BY tablename;
+            """)).fetchall()
             out["tables"] = [{"schema":r[0], "table":r[1]} for r in rows]
-            # licznik dla message (jeśli istnieje)
+            cols = db.session.execute(sa_text("""
+                SELECT column_name, data_type FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='message'
+                ORDER BY ordinal_position;
+            """)).fetchall()
+            out["message_columns"] = [{"name": c[0], "type": c[1]} for c in cols]
             cnt = db.session.execute(sa_text("SELECT COUNT(*) FROM public.message;")).scalar()
             out["message_count"] = int(cnt)
         else:
             rows = db.session.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")).fetchall()
             out["tables"] = [{"table": r[0]} for r in rows]
+            cols = db.session.execute(sa_text("PRAGMA table_info(message);")).fetchall()
+            out["message_columns"] = [{"name": c[1], "type": c[2]} for c in cols]
             cnt = db.session.execute(sa_text("SELECT COUNT(*) FROM message;")).scalar()
             out["message_count"] = int(cnt)
         return jsonify({"ok": True, "db": out})
@@ -300,7 +321,7 @@ def chat():
         except Exception as e:
             reply = f"(fallback) {reply} – openai_error: {e}"
 
-    # Upewnij się, że tabela istnieje
+    # Gwarancja schematu (kolumny + indeksy)
     ensure_schema()
 
     saved = False
