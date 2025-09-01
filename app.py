@@ -113,6 +113,12 @@ def _db_status() -> str:
     except Exception:
         return "error"
 
+def _db_scheme_info(uri: str) -> Dict[str, str]:
+    # zwraca "kind" i skrócony "scheme" do diagnostyki
+    scheme = (uri.split("://", 1)[0] if "://" in uri else uri).lower()
+    kind = "postgres" if "postgres" in scheme else ("sqlite" if "sqlite" in scheme else scheme)
+    return {"kind": kind, "scheme": scheme}
+
 # ─────────────────────── Routes ──────────────────────────
 @app.route("/")
 def root():
@@ -120,7 +126,13 @@ def root():
 
 @app.route("/api/health")
 def health():
-    return jsonify({"ok": True, "time": int(time.time()), "db": _db_status(), "build": BUILD})
+    return jsonify({
+        "ok": True,
+        "time": int(time.time()),
+        "db": _db_status(),
+        "db_url": _db_scheme_info(db_url),
+        "build": BUILD
+    })
 
 @app.route("/api/db-ping")
 def db_ping():
@@ -187,24 +199,42 @@ def history_db():
 
     return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more})
 
+# ─────── /api/history/recent — ostatnie N bez filtrów ────
+@app.route("/api/history/recent", methods=["GET"])
+def history_recent():
+    limit_raw = request.args.get("limit", "")
+    try:
+        limit = int(limit_raw)
+    except Exception:
+        limit = 10
+    limit = max(1, min(50, limit))
+    q = Message.query.order_by(Message.timestamp.desc(), Message.id.desc()).limit(limit)
+    items = [serialize_message(m) for m in q.all()]
+    return jsonify({"ok": True, "items": items, "limit": limit})
+
 # ─────────────────────── /api/chat ────────────────────────
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
 
+    # Turnstile (dev: BYPASS_TURNSTILE_DEV=1 w Railway Variables)
     ok_ts, details = verify_turnstile(data.get("cf_turnstile_token"), request.remote_addr)
     if not ok_ts:
         return jsonify({"ok": False, "error": "turnstile_failed", "details": details}), 403
 
+    # Treść wiadomości
     user_message = _extract_message(data)
     if not user_message:
-        return jsonify({"error": "message is required"}), 400
+        return jsonify({"ok": False, "error": "message is required"}), 400
 
-    # identyfikacja rozmowy (pozwala filtrować historię)
+    # Identyfikacja rozmowy (do historii)
     user_id    = _clip(data.get("user_id"), 64)
     session_id = _clip(data.get("session_id"), 64)
 
+    # Domyślna odpowiedź (fallback)
     reply = f"Echo: {user_message}"
+
+    # OpenAI (SDK 1.x)
     if openai_client and OPENAI_API_KEY:
         try:
             resp = openai_client.chat.completions.create(
@@ -219,20 +249,23 @@ def chat():
         except Exception as e:
             reply = f"(fallback) {reply} – openai_error: {e}"
 
-    # zapis do DB (best-effort)
+    # Zapis do DB (obie wiadomości, best-effort) + informacja czy się udało
+    saved = False
     try:
         db.session.add(Message(role="user", content=user_message, user_id=user_id, session_id=session_id))
         db.session.add(Message(role="jack", content=reply,       user_id=user_id, session_id=session_id))
         db.session.commit()
-    except Exception:
+        saved = True
+    except Exception as e:
+        # widoczne w logach Railway (Deploy/HTTP logs)
+        print(f"[chat][DB-ERROR] {e}")
         db.session.rollback()
 
-    return jsonify({"ok": True, "reply": reply, "build": BUILD})
+    return jsonify({"ok": True, "reply": reply, "saved": saved, "build": BUILD})
 
 # ────────────────────── Local run (dev) ───────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
 
 
 
