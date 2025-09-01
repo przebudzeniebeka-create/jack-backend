@@ -1,164 +1,194 @@
 # app.py
 from __future__ import annotations
 
-import os
-import sys
-import importlib
-from typing import Optional, List, Dict, Any
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import os, json, time, requests
+from typing import Optional, Dict
+from datetime import datetime
 
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy import text as sa_text
-from werkzeug.middleware.dispatcher import DispatcherMiddleware
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DB handle (initialized later inside create_app)
-# ─────────────────────────────────────────────────────────────────────────────
-db = SQLAlchemy()
+from dotenv import load_dotenv
+load_dotenv()
 
+# --------------------------- Flask ---------------------------
+app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
+try:
+    app.json.ensure_ascii = False
+except Exception:
+    pass
 
-def _normalize_db_url(url: Optional[str]) -> Optional[str]:
-    """
-    Make the URL SQLAlchemy/psycopg2 friendly and force SSL.
-    - postgres:// -> postgresql+psycopg2://
-    - ensure ?sslmode=require (or PGSSLMODE if set)
-    """
-    if not url:
-        return None
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+# Build info (do szybkiego sprawdzenia świeżości deployu)
+BUILD = {
+    "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("COMMIT_SHA") or "dev",
+    "boot_ts": int(time.time()),
+}
 
-    try:
-        parsed = urlparse(url)
-        q = dict(parse_qsl(parsed.query))
-        if "sslmode" not in q:
-            q["sslmode"] = os.getenv("PGSSLMODE", "require")
-        new_query = urlencode(q)
-        url = urlunparse(parsed._replace(query=new_query))
-    except Exception:
-        pass
+# ------------------------ Database --------------------------
+# MUSI być ustawione w Railway: DATABASE_URL=postgresql+psycopg2://...?...sslmode=require
+db_url = os.getenv("DATABASE_URL", "sqlite:///app.db")
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
 
-    return url
+class Message(db.Model):
+    __tablename__ = "Message"
+    id         = db.Column(db.Integer, primary_key=True)
+    role       = db.Column(db.String(10))      # 'user' | 'jack'
+    content    = db.Column(db.Text)
+    timestamp  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    user_id    = db.Column(db.String(64), index=True)
+    session_id = db.Column(db.String(64), index=True)
 
+with app.app_context():
+    db.create_all()
 
-def _collect_routes(flask_app: Flask) -> List[Dict[str, Any]]:
-    routes: List[Dict[str, Any]] = []
-    for rule in flask_app.url_map.iter_rules():
-        routes.append({
-            "rule": str(rule),
-            "endpoint": rule.endpoint,
-            "methods": sorted(m for m in rule.methods if m not in {"HEAD", "OPTIONS"}),
-        })
-    routes.sort(key=lambda r: r["rule"])
-    return routes
-
-
-def create_app() -> Flask:
-    app = Flask(__name__)
-
-    # ── Config: Database URL
-    db_url = (
-        os.getenv("DATABASE_URL")
-        or os.getenv("SUPABASE_DB_URL")
-        or os.getenv("SQLALCHEMY_DATABASE_URI")
-    )
-    db_url = _normalize_db_url(db_url)
-
-    if not db_url:
-        app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///local.db"
-        app.config["DB_WARN"] = "DATABASE_URL missing; using sqlite:///local.db"
-    else:
-        app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-    # ── Engine options: healthy connection pool
-    engine_opts = {
-        "pool_pre_ping": True,
-        "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "300")),
-        "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),
-        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "2")),
-        "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "30")),
+def serialize_message(m: "Message") -> Dict[str, object]:
+    return {
+        "id": m.id,
+        "role": m.role,
+        "content": m.content,
+        "timestamp": (m.timestamp.isoformat() if m.timestamp else None),
+        "user_id": m.user_id,
+        "session_id": m.session_id,
     }
-    connect_args = {}
-    if (db_url or "").startswith("postgresql+psycopg2://"):
-        connect_args["sslmode"] = os.getenv("PGSSLMODE", "require")
-    if connect_args:
-        engine_opts["connect_args"] = connect_args
-    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_opts
 
-    # ── CORS (na razie otwarte; zawęzimy po testach)
-    CORS(app, resources={r"/*": {"origins": "*"}})
+# -------------------------- CORS ----------------------------
+# Na czas testów szeroko; później zawężamy do *.jackqs.ai i lokalnych devów.
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-    # ── Init DB
-    db.init_app(app)
+# ------------------------ Turnstile -------------------------
+TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET_KEY", "")
+BYPASS_TURNSTILE_DEV = os.getenv("BYPASS_TURNSTILE_DEV", "0")  # "1" = pomiń weryfikację
 
-    # ── Basic routes
-    @app.get("/")
-    def root():
-        return jsonify({"ok": True, "msg": "Jack backend is running 🚀 (see /api/health)"}), 200
-
-    @app.get("/api/health")
-    def health():
-        info = {
-            "ok": True,
-            "warn": app.config.get("DB_WARN"),
-            "legacy": app.config.get("LEGACY_STATUS", "not-mounted"),
-        }
-        if not db_url:
-            info["db"] = "sqlite-fallback"
-            return jsonify(info), 200
-
-        try:
-            with db.engine.connect() as conn:
-                conn.execute(sa_text("SELECT 1"))
-            info["db"] = "ok"
-        except Exception as e:
-            info["db"] = "error"
-            info["error"] = f"{e.__class__.__name__}: {e}"
-            return jsonify(info), 200
-
-        return jsonify(info), 200
-
-    # ── NEW: list all routes (main + legacy)
-    @app.get("/api/routes")
-    def routes():
-        data = {"main": _collect_routes(app)}
-        legacy_app = app.config.get("LEGACY_APP_REF")
-        if legacy_app is not None:
-            try:
-                data["legacy"] = _collect_routes(legacy_app)  # type: ignore[arg-type]
-            except Exception as e:
-                data["legacy_error"] = f"{e.__class__.__name__}: {e}"
-        else:
-            data["legacy"] = []
-        return jsonify(data), 200
-
-    # ── Mount legacy (from app_legacy.py) under /legacy
+def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> tuple[bool, dict]:
+    # DEV bypass lub brak secretu -> nie blokuj
+    if BYPASS_TURNSTILE_DEV == "1":
+        return True, {"dev": "bypass"}
+    if not TURNSTILE_SECRET:
+        return True, {"dev": "no_secret"}
+    if not token:
+        return False, {"error": "missing_token"}
     try:
-        legacy_mod = importlib.import_module("app_legacy")  # file added earlier
-        legacy_app = getattr(legacy_mod, "app", None)
-        if legacy_app is None and hasattr(legacy_mod, "create_app"):
-            legacy_app = legacy_mod.create_app()
-
-        if legacy_app is not None:
-            app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/legacy": legacy_app})
-            app.config["LEGACY_STATUS"] = "mounted"
-            app.config["LEGACY_APP_REF"] = legacy_app
-        else:
-            app.config["LEGACY_STATUS"] = "not-found"
+        r = requests.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data={"secret": TURNSTILE_SECRET, "response": token, "remoteip": remote_ip or ""},
+            timeout=4,
+        )
+        data = r.json()
+        return bool(data.get("success")), data
     except Exception as e:
-        print("LEGACY attach failed:", e, file=sys.stderr)
-        app.config["LEGACY_STATUS"] = "failed"
-        app.config["LEGACY_ERROR"] = str(e)
+        return False, {"error": str(e)}
 
-    return app
+# -------------------------- OpenAI --------------------------
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("openai_api_key")
+try:
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+except Exception:
+    openai_client = None  # brak klucza nie powinien blokować startu
 
+# ------------------------- Helpers --------------------------
+def _extract_message(data: dict) -> Optional[str]:
+    for k in ("message", "text", "prompt", "query", "q"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
 
-# Export global 'app' for gunicorn "wsgi:app"
-app = create_app()
+def _db_status() -> str:
+    try:
+        db.session.execute(sa_text("SELECT 1"))
+        return "ok"
+    except Exception:
+        return "error"
+
+# -------------------------- Routes --------------------------
+@app.route("/")
+def root():
+    return "Jack backend – OK. Użyj /api/health"
+
+@app.route("/api/health")
+def health():
+    # lekki healthcheck + minimalny status DB + build info
+    return jsonify({
+        "ok": True,
+        "time": int(time.time()),
+        "db": _db_status(),
+        "build": BUILD,
+    })
+
+@app.route("/api/db-ping")
+def db_ping():
+    try:
+        db.session.execute(sa_text("SELECT 1"))
+        return jsonify({"db": "ok"})
+    except Exception as e:
+        return jsonify({"db": "error", "error": str(e)}), 500
+
+@app.route("/api/routes")
+def routes_list():
+    # Podgląd tras głównej appki (bez rozróżniania legacy)
+    rules = sorted([str(r.rule) for r in app.url_map.iter_rules()])
+    return jsonify(rules)
+
+@app.route("/api/history", methods=["GET"])
+def history_min():
+    """
+    Sanity endpoint — na teraz zwraca pustą listę.
+    W następnym kroku podmienimy na wersję z SQLAlchemy i filtrami.
+    """
+    # opcjonalnie: przyjmij parametry, żeby frontend mógł już wołać /api/history?user_id=...
+    _user_id = request.args.get("user_id", "")
+    _session = request.args.get("session_id", "")
+    _limit = request.args.get("limit", "")
+    _offset = request.args.get("offset", "")
+    return jsonify([])
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    data = request.get_json(silent=True) or {}
+    ok_ts, details = verify_turnstile(data.get("cf_turnstile_token"), request.remote_addr)
+    if not ok_ts:
+        return jsonify({"ok": False, "error": "turnstile_failed", "details": details}), 403
+
+    user_message = _extract_message(data)
+    if not user_message:
+        return jsonify({"error": "message is required"}), 400
+
+    # prosta odpowiedź, a jeśli jest OpenAI – użyj
+    reply = f"Echo: {user_message}"
+    if openai_client and OPENAI_API_KEY:
+        try:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are Jack."},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.7,
+            )
+            reply = resp.choices[0].message.content
+        except Exception as e:
+            reply = f"(fallback) {reply} – openai_error: {e}"
+
+    # best-effort zapis do DB (bez twardego faila, żeby nie blokować odpowiedzi)
+    try:
+        db.session.add(Message(role="user", content=user_message))
+        db.session.add(Message(role="jack", content=reply))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    return jsonify({"reply": reply})
+
+# ------------------------- Run local ------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
 
 
 
