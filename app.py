@@ -1,11 +1,11 @@
 # app.py
 from __future__ import annotations
 
-import os, re, time, requests, traceback
+import os, re, time, requests, traceback, uuid
 from typing import Optional, Dict, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy import text as sa_text
@@ -27,8 +27,26 @@ BUILD = {
     "boot_ts": int(time.time()),
 }
 
+# request-id na każdy request
+@app.before_request
+def _assign_req_id():
+    g.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+
+@app.after_request
+def _add_std_headers(resp):
+    # wystawiamy ID żądania i umożliwiamy odczyt w przeglądarce (CORS)
+    resp.headers["X-Request-ID"] = g.get("request_id", "")
+    # expose, by front mógł czytać nagłówki
+    existing = resp.headers.get("Access-Control-Expose-Headers", "")
+    expose = [h.strip() for h in existing.split(",") if h.strip()]
+    for h in ("X-Request-ID", "Retry-After"):
+        if h not in expose:
+            expose.append(h)
+    resp.headers["Access-Control-Expose-Headers"] = ", ".join(expose)
+    return resp
+
 # ──────────────────────── Database ───────────────────────
-db_url = os.getenv("DATABASE_URL", "sqlite:///app.db")  # Railway: postgresql+psycopg2://...?...sslmode=require
+db_url = os.getenv("DATABASE_URL", "sqlite:///app.db")
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
@@ -44,23 +62,19 @@ def _db_scheme_info(uri: str) -> Dict[str, str]:
     kind = "postgres" if "postgres" in scheme else ("sqlite" if "sqlite" in scheme else scheme)
     return {"kind": kind, "scheme": scheme}
 
-# ORM korzysta z małoliterowej tabeli `message`
 class Message(db.Model):
-    __tablename__ = "message"
+    __tablename__ = "message"  # w DB: public.message
     id         = db.Column(db.Integer, primary_key=True)
-    role       = db.Column(db.String(10))      # 'user' | 'jack'
+    role       = db.Column(db.String(10))
     content    = db.Column(db.Text)
     timestamp  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     user_id    = db.Column(db.String(64), index=True)
     session_id = db.Column(db.String(64), index=True)
 
 # ─────────────────────── Rate limit ──────────────────────
-# Tabela liczników (współdzielona między workerami)
-# Klucz = "ip:<ip>:<bucket_ts>" albo "user:<user_id>:<bucket_ts>"
 RATE_TABLE = "public.rate_limit_usage" if _db_kind() == "postgres" else "rate_limit_usage"
 
 def parse_rate(s: Optional[str], default_limit: int, default_window: int) -> Tuple[int, int]:
-    """Format: 'limit/window_sec', np. '20/60'."""
     try:
         if not s: return default_limit, default_window
         parts = s.strip().split("/")
@@ -68,11 +82,8 @@ def parse_rate(s: Optional[str], default_limit: int, default_window: int) -> Tup
     except Exception:
         return default_limit, default_window
 
-RATE_LIMIT_IP    = parse_rate(os.getenv("RATE_LIMIT_IP"),    30, 60)  # 30/min
-RATE_LIMIT_USER  = parse_rate(os.getenv("RATE_LIMIT_USER"),  60, 60)  # 60/min
-
-def _now_utc() -> datetime:
-    return datetime.utcnow()
+RATE_LIMIT_IP    = parse_rate(os.getenv("RATE_LIMIT_IP"),    30, 60)
+RATE_LIMIT_USER  = parse_rate(os.getenv("RATE_LIMIT_USER"),  60, 60)
 
 def _bucket_start(window_sec: int) -> datetime:
     ts = int(time.time())
@@ -80,7 +91,6 @@ def _bucket_start(window_sec: int) -> datetime:
     return datetime.utcfromtimestamp(bucket)
 
 def _client_ip() -> str:
-    # Cloudflare przekazuje prawdziwe IP w CF-Connecting-IP
     ip = request.headers.get("CF-Connecting-IP")
     if ip: return ip
     xff = request.headers.get("X-Forwarded-For", "")
@@ -91,7 +101,6 @@ def _client_ip() -> str:
     return ip or (request.remote_addr or "0.0.0.0")
 
 def ensure_schema() -> None:
-    """Tworzy/aktualizuje: public.message, rate_limit_usage + indeksy. Kopiuje dane ze starej 'Message' jeśli trzeba."""
     try:
         # message
         if _db_kind() == "postgres":
@@ -163,7 +172,6 @@ with app.app_context():
     ensure_schema()
 
 def _rl_upsert_and_get_count(key: str, window_start: datetime) -> Optional[int]:
-    """Zwiększa licznik i zwraca count w bieżącym buckecie. Błąd ⇒ None (nie blokujemy ruchu przy awarii)."""
     try:
         if _db_kind() == "postgres":
             res = db.session.execute(
@@ -179,11 +187,7 @@ def _rl_upsert_and_get_count(key: str, window_start: datetime) -> Optional[int]:
             db.session.commit()
             return int(res[0]) if res else 1
         else:
-            # SQLite: spróbuj UPDATE → jeśli nic nie zaktualizowano, zrób INSERT; na końcu SELECT
-            upd = db.session.execute(
-                sa_text(f"UPDATE {RATE_TABLE} SET count = count + 1 WHERE key = :key"),
-                {"key": key},
-            )
+            upd = db.session.execute(sa_text(f"UPDATE {RATE_TABLE} SET count = count + 1 WHERE key = :key"), {"key": key})
             if upd.rowcount == 0:
                 try:
                     db.session.execute(
@@ -191,16 +195,9 @@ def _rl_upsert_and_get_count(key: str, window_start: datetime) -> Optional[int]:
                         {"key": key, "ws": window_start},
                     )
                 except Exception:
-                    # wyścig? spróbuj ponownie UPDATE
-                    db.session.execute(
-                        sa_text(f"UPDATE {RATE_TABLE} SET count = count + 1 WHERE key = :key"),
-                        {"key": key},
-                    )
+                    db.session.execute(sa_text(f"UPDATE {RATE_TABLE} SET count = count + 1 WHERE key = :key"), {"key": key})
             db.session.commit()
-            row = db.session.execute(
-                sa_text(f"SELECT count FROM {RATE_TABLE} WHERE key = :key"),
-                {"key": key},
-            ).fetchone()
+            row = db.session.execute(sa_text(f"SELECT count FROM {RATE_TABLE} WHERE key = :key"), {"key": key}).fetchone()
             return int(row[0]) if row else 1
     except Exception as e:
         db.session.rollback()
@@ -208,7 +205,6 @@ def _rl_upsert_and_get_count(key: str, window_start: datetime) -> Optional[int]:
         return None
 
 def _ratelimit(scope: str, ident: Optional[str], limit: int, window_sec: int) -> Tuple[bool, Optional[Dict]]:
-    """Zlicza żądania; True=OK, False=zablokuj. Zwraca też payload z informacją o retry."""
     if not ident:
         return True, None
     try:
@@ -216,18 +212,31 @@ def _ratelimit(scope: str, ident: Optional[str], limit: int, window_sec: int) ->
         key = f"{scope}:{ident}:{int(ws.timestamp())}"
         count = _rl_upsert_and_get_count(key, ws)
         if count is None:
-            return True, None  # awaria licznika nie blokuje
+            return True, None
         if count > limit:
             retry_in = window_sec - (int(time.time()) % window_sec) + 1
             return False, {
-                "ok": False, "error": "rate_limited",
-                "scope": scope, "limit": limit, "window_sec": window_sec,
-                "retry_in": retry_in
+                "ok": False,
+                "error": "rate_limited",
+                "scope": scope,
+                "limit": limit,
+                "window_sec": window_sec,
+                "retry_in": retry_in,
             }
         return True, None
     except Exception as e:
         print(f"[ratelimit][FALLBACK-ALLOW] {e}")
         return True, None
+
+def _rate_limited_response(pay: Dict) -> "flask.Response":
+    # dołóż request_id do payloadu (wygodne w logach frontu)
+    pay = dict(pay)
+    pay["request_id"] = g.get("request_id", "")
+    resp = jsonify(pay)
+    resp.status_code = 429
+    if "retry_in" in pay and pay["retry_in"] is not None:
+        resp.headers["Retry-After"] = str(int(pay["retry_in"]))
+    return resp
 
 def serialize_message(m: "Message") -> Dict[str, object]:
     return {
@@ -249,6 +258,7 @@ CORS(app, resources={
         "allow_headers": ["Content-Type", "Authorization"],
         "supports_credentials": False,
         "max_age": 600,
+        "expose_headers": ["X-Request-ID", "Retry-After"],
     }
 })
 
@@ -310,27 +320,16 @@ def root():
 
 @app.route("/api/health")
 def health():
-    return jsonify({
-        "ok": True, "time": int(time.time()),
-        "db": _db_status(), "db_url": _db_scheme_info(db_url),
-        "build": BUILD
-    })
+    return jsonify({"ok": True, "time": int(time.time()), "db": _db_status(), "db_url": _db_scheme_info(db_url), "build": BUILD, "request_id": g.get("request_id")})
 
 @app.route("/api/db-debug")
 def db_debug():
     out = {"kind": _db_scheme_info(db_url)["kind"], "tables": [], "message_columns": []}
     try:
         if _db_kind() == "postgres":
-            rows = db.session.execute(sa_text("""
-                SELECT schemaname, tablename FROM pg_tables
-                WHERE schemaname='public' ORDER BY tablename;
-            """)).fetchall()
+            rows = db.session.execute(sa_text("SELECT schemaname, tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename;")).fetchall()
             out["tables"] = [{"schema":r[0], "table":r[1]} for r in rows]
-            cols = db.session.execute(sa_text("""
-                SELECT column_name, data_type FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='message'
-                ORDER BY ordinal_position;
-            """)).fetchall()
+            cols = db.session.execute(sa_text("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='public' AND table_name='message' ORDER BY ordinal_position;")).fetchall()
             out["message_columns"] = [{"name": c[0], "type": c[1]} for c in cols]
             cnt = db.session.execute(sa_text("SELECT COUNT(*) FROM public.message;")).scalar()
             out["message_count"] = int(cnt)
@@ -341,9 +340,9 @@ def db_debug():
             out["message_columns"] = [{"name": c[1], "type": c[2]} for c in cols]
             cnt = db.session.execute(sa_text("SELECT COUNT(*) FROM message;")).scalar()
             out["message_count"] = int(cnt)
-        return jsonify({"ok": True, "db": out})
+        return jsonify({"ok": True, "db": out, "request_id": g.get("request_id")})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "db": out}), 500
+        return jsonify({"ok": False, "error": str(e), "db": out, "request_id": g.get("request_id")}), 500
 
 @app.route("/api/routes")
 def routes_list():
@@ -353,14 +352,14 @@ def routes_list():
 # ─────────── /api/history — ORM + RAW SQL fallback ───────
 @app.route("/api/history", methods=["GET"])
 def history_db():
-    # Rate-limit (IP + user_id jeśli jest)
     ip = _client_ip()
     ok_ip, pay = _ratelimit("ip", ip, *RATE_LIMIT_IP)
-    if not ok_ip: return jsonify(pay), 429
+    if not ok_ip: return _rate_limited_response(pay)
+
     user_id_for_rl = (request.args.get("user_id") or "").strip()
     if user_id_for_rl:
         ok_user, pay2 = _ratelimit("user", user_id_for_rl, *RATE_LIMIT_USER)
-        if not ok_user: return jsonify(pay2), 429
+        if not ok_user: return _rate_limited_response(pay2)
 
     args = request.args
     user_id    = _clip(args.get("user_id", ""), 64)
@@ -385,7 +384,6 @@ def history_db():
     since_ts = _parse_ts(args.get("since_ts", ""))
     until_ts = _parse_ts(args.get("until_ts", ""))
 
-    # 1) ORM
     try:
         q = Message.query
         if user_id:    q = q.filter(Message.user_id == user_id)
@@ -400,25 +398,19 @@ def history_db():
         items = [serialize_message(m) for m in rows]
         has_more = len(items) > limit
         if has_more: items = items[:limit]
-        return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more})
+        return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more, "request_id": g.get("request_id")})
     except Exception as e:
         print(f"[history][ORM-ERROR] {e}\n{traceback.format_exc()}")
 
-    # 2) RAW SQL fallback
     try:
         table = "public.message" if _db_kind() == "postgres" else "message"
         where = []
         params: Dict[str, object] = {}
-        if user_id:
-            where.append("user_id = :user_id"); params["user_id"] = user_id
-        if session_id:
-            where.append("session_id = :session_id"); params["session_id"] = session_id
-        if role in ("user", "jack"):
-            where.append("role = :role"); params["role"] = role
-        if since_ts is not None:
-            where.append("timestamp >= :since_ts"); params["since_ts"] = since_ts
-        if until_ts is not None:
-            where.append("timestamp <= :until_ts"); params["until_ts"] = until_ts
+        if user_id:    where.append("user_id = :user_id");    params["user_id"] = user_id
+        if session_id: where.append("session_id = :session_id"); params["session_id"] = session_id
+        if role in ("user", "jack"): where.append("role = :role"); params["role"] = role
+        if since_ts is not None: where.append("timestamp >= :since_ts"); params["since_ts"] = since_ts
+        if until_ts is not None: where.append("timestamp <= :until_ts"); params["until_ts"] = until_ts
         if search:
             like = "ILIKE" if _db_kind() == "postgres" else "LIKE"
             where.append(f"content {like} :search"); params["search"] = f"%{search}%"
@@ -444,18 +436,17 @@ def history_db():
             })
         has_more = len(items) > limit
         if has_more: items = items[:limit]
-        return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more})
+        return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more, "request_id": g.get("request_id")})
     except Exception as e:
         print(f"[history][RAW-ERROR] {e}\n{traceback.format_exc()}")
-        return jsonify({"ok": False, "error": "history_failed"}), 500
+        return jsonify({"ok": False, "error": "history_failed", "request_id": g.get("request_id")}), 500
 
 # ─────── /api/history/recent — ostatnie N bez filtrów ────
 @app.route("/api/history/recent", methods=["GET"])
 def history_recent():
-    # prosty rate-limit po IP
     ip = _client_ip()
     ok_ip, pay = _ratelimit("ip", ip, *RATE_LIMIT_IP)
-    if not ok_ip: return jsonify(pay), 429
+    if not ok_ip: return _rate_limited_response(pay)
 
     try:
         limit = int(request.args.get("limit", "10"))
@@ -465,32 +456,31 @@ def history_recent():
     try:
         q = Message.query.order_by(Message.timestamp.desc(), Message.id.desc()).limit(limit)
         items = [serialize_message(m) for m in q.all()]
-        return jsonify({"ok": True, "items": items, "limit": limit})
+        return jsonify({"ok": True, "items": items, "limit": limit, "request_id": g.get("request_id")})
     except Exception as e:
         print(f"[recent][ERROR] {e}\n{traceback.format_exc()}")
-        return jsonify({"ok": False, "error": "recent_failed"}), 500
+        return jsonify({"ok": False, "error": "recent_failed", "request_id": g.get("request_id")}), 500
 
 # ─────────────────────── /api/chat ────────────────────────
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    # Rate-limit (IP + user jeśli podany)
     ip = _client_ip()
     ok_ip, pay = _ratelimit("ip", ip, *RATE_LIMIT_IP)
-    if not ok_ip: return jsonify(pay), 429
+    if not ok_ip: return _rate_limited_response(pay)
 
     data = request.get_json(silent=True) or {}
     user_id    = _clip((data.get("user_id") or ""), 64)
     if user_id:
         ok_user, pay2 = _ratelimit("user", user_id, *RATE_LIMIT_USER)
-        if not ok_user: return jsonify(pay2), 429
+        if not ok_user: return _rate_limited_response(pay2)
 
     ok_ts, details = verify_turnstile(data.get("cf_turnstile_token"), ip)
     if not ok_ts:
-        return jsonify({"ok": False, "error": "turnstile_failed", "details": details}), 403
+        return jsonify({"ok": False, "error": "turnstile_failed", "details": details, "request_id": g.get("request_id")}), 403
 
     user_message = _extract_message(data)
     if not user_message:
-        return jsonify({"ok": False, "error": "message is required"}), 400
+        return jsonify({"ok": False, "error": "message is required", "request_id": g.get("request_id")}), 400
 
     session_id = _clip(data.get("session_id"), 64)
     reply = f"Echo: {user_message}"
@@ -510,11 +500,9 @@ def chat():
             reply = f"(fallback) {reply} – openai_error: {e}"
 
     ensure_schema()
-
     saved = False
     db_error = None
 
-    # 1) ORM insert
     try:
         db.session.add(Message(role="user", content=user_message, user_id=user_id, session_id=session_id))
         db.session.add(Message(role="jack", content=reply,       user_id=user_id, session_id=session_id))
@@ -524,25 +512,15 @@ def chat():
         db.session.rollback()
         db_error = f"orm_insert_failed: {e1}"
         print(f"[chat][DB-ERROR][ORM] {e1}\n{traceback.format_exc()}")
-
-        # 2) RAW SQL fallback insert
         try:
-            if _db_kind() == "postgres":
-                db.session.execute(
-                    sa_text("""
-                        INSERT INTO public.message (role, content, user_id, session_id)
-                        VALUES (:r1, :c1, :u, :s), (:r2, :c2, :u, :s)
-                    """),
-                    {"r1": "user", "c1": user_message, "r2": "jack", "c2": reply, "u": user_id, "s": session_id},
-                )
-            else:
-                db.session.execute(
-                    sa_text("""
-                        INSERT INTO message (role, content, user_id, session_id)
-                        VALUES (:r1, :c1, :u, :s), (:r2, :c2, :u, :s)
-                    """),
-                    {"r1": "user", "c1": user_message, "r2": "jack", "c2": reply, "u": user_id, "s": session_id},
-                )
+            table = "public.message" if _db_kind() == "postgres" else "message"
+            db.session.execute(
+                sa_text(f"""
+                    INSERT INTO {table} (role, content, user_id, session_id)
+                    VALUES (:r1, :c1, :u, :s), (:r2, :c2, :u, :s)
+                """),
+                {"r1": "user", "c1": user_message, "r2": "jack", "c2": reply, "u": user_id, "s": session_id},
+            )
             db.session.commit()
             saved = True
         except Exception as e2:
@@ -550,12 +528,11 @@ def chat():
             db_error = f"{db_error}; raw_insert_failed: {e2}"
             print(f"[chat][DB-ERROR][RAW] {e2}\n{traceback.format_exc()}")
 
-    return jsonify({"ok": True, "reply": reply, "saved": saved, "db_error": db_error, "build": BUILD})
+    return jsonify({"ok": True, "reply": reply, "saved": saved, "db_error": db_error, "build": BUILD, "request_id": g.get("request_id")})
 
 # ────────────────────── Local run (dev) ───────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
 
 
 
