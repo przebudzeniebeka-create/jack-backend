@@ -11,6 +11,7 @@ from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy import text as sa_text
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DB handle (initialized later inside create_app)
@@ -73,7 +74,7 @@ def create_app() -> Flask:
 
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-    # ── Engine options to keep connections healthy
+    # ── Engine options: healthy connection pool
     engine_opts = {
         "pool_pre_ping": True,
         "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "300")),
@@ -88,7 +89,7 @@ def create_app() -> Flask:
         engine_opts["connect_args"] = connect_args
     app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_opts
 
-    # ── CORS
+    # ── CORS (na razie otwarte; zawęzimy po testach)
     CORS(app, resources={r"/*": {"origins": "*"}})
 
     # ── Init DB
@@ -121,7 +122,7 @@ def create_app() -> Flask:
 
         return jsonify(info), 200
 
-    # New: list routes (main + legacy if mounted)
+    # ── NEW: list all routes (main + legacy)
     @app.get("/api/routes")
     def routes():
         data = {"main": _collect_routes(app)}
@@ -135,7 +136,7 @@ def create_app() -> Flask:
             data["legacy"] = []
         return jsonify(data), 200
 
-    # ── Try to mount legacy app (from app_legacy.py) under /legacy
+    # ── Mount legacy (from app_legacy.py) under /legacy
     try:
         legacy_mod = importlib.import_module("app_legacy")  # file added earlier
         legacy_app = getattr(legacy_mod, "app", None)
@@ -143,7 +144,6 @@ def create_app() -> Flask:
             legacy_app = legacy_mod.create_app()
 
         if legacy_app is not None:
-            from werkzeug.middleware.dispatcher import DispatcherMiddleware
             app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/legacy": legacy_app})
             app.config["LEGACY_STATUS"] = "mounted"
             app.config["LEGACY_APP_REF"] = legacy_app
