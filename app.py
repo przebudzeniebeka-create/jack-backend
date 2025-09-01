@@ -1,9 +1,9 @@
 # app.py
 from __future__ import annotations
 
-import os, time, requests, traceback
-from typing import Optional, Dict
-from datetime import datetime
+import os, re, time, requests, traceback
+from typing import Optional, Dict, Tuple
+from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -11,8 +11,6 @@ from flask_cors import CORS
 from sqlalchemy import text as sa_text
 from dateutil import parser as dtparser
 from dotenv import load_dotenv
-import re
-
 
 load_dotenv()
 
@@ -56,16 +54,49 @@ class Message(db.Model):
     user_id    = db.Column(db.String(64), index=True)
     session_id = db.Column(db.String(64), index=True)
 
-def ensure_schema() -> None:
-    """
-    Tworzy public.message, dodaje kolumny user_id/session_id i indeksy.
-    Jeśli istnieje stara public."Message" a nie ma public.message → tworzy message i kopiuje dane.
-    """
+# ─────────────────────── Rate limit ──────────────────────
+# Tabela liczników (współdzielona między workerami)
+# Klucz = "ip:<ip>:<bucket_ts>" albo "user:<user_id>:<bucket_ts>"
+RATE_TABLE = "public.rate_limit_usage" if _db_kind() == "postgres" else "rate_limit_usage"
+
+def parse_rate(s: Optional[str], default_limit: int, default_window: int) -> Tuple[int, int]:
+    """Format: 'limit/window_sec', np. '20/60'."""
     try:
+        if not s: return default_limit, default_window
+        parts = s.strip().split("/")
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        return default_limit, default_window
+
+RATE_LIMIT_IP    = parse_rate(os.getenv("RATE_LIMIT_IP"),    30, 60)  # 30/min
+RATE_LIMIT_USER  = parse_rate(os.getenv("RATE_LIMIT_USER"),  60, 60)  # 60/min
+
+def _now_utc() -> datetime:
+    return datetime.utcnow()
+
+def _bucket_start(window_sec: int) -> datetime:
+    ts = int(time.time())
+    bucket = ts - (ts % window_sec)
+    return datetime.utcfromtimestamp(bucket)
+
+def _client_ip() -> str:
+    # Cloudflare przekazuje prawdziwe IP w CF-Connecting-IP
+    ip = request.headers.get("CF-Connecting-IP")
+    if ip: return ip
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        ip = xff.split(",")[0].strip()
+        if ip: return ip
+    ip = request.headers.get("X-Real-IP")
+    return ip or (request.remote_addr or "0.0.0.0")
+
+def ensure_schema() -> None:
+    """Tworzy/aktualizuje: public.message, rate_limit_usage + indeksy. Kopiuje dane ze starej 'Message' jeśli trzeba."""
+    try:
+        # message
         if _db_kind() == "postgres":
             exists_message = db.session.execute(sa_text("SELECT to_regclass('public.message');")).scalar()
             exists_Message = db.session.execute(sa_text("SELECT to_regclass('public.\"Message\"');")).scalar()
-
             if not exists_message:
                 db.session.execute(sa_text("""
                     CREATE TABLE IF NOT EXISTS public.message (
@@ -81,16 +112,13 @@ def ensure_schema() -> None:
                         SELECT role, content, timestamp FROM public."Message";
                     """))
                 db.session.commit()
-
             db.session.execute(sa_text('ALTER TABLE public.message ADD COLUMN IF NOT EXISTS user_id VARCHAR(64);'))
             db.session.execute(sa_text('ALTER TABLE public.message ADD COLUMN IF NOT EXISTS session_id VARCHAR(64);'))
-
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_ts ON public.message(timestamp);'))
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_user ON public.message(user_id);'))
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_session ON public.message(session_id);'))
             db.session.commit()
-
-        else:  # SQLite
+        else:
             db.session.execute(sa_text("""
                 CREATE TABLE IF NOT EXISTS message (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,12 +133,101 @@ def ensure_schema() -> None:
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_user ON message(user_id);'))
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id);'))
             db.session.commit()
+
+        # rate_limit_usage
+        if _db_kind() == "postgres":
+            db.session.execute(sa_text(f"""
+                CREATE TABLE IF NOT EXISTS {RATE_TABLE} (
+                    key VARCHAR(128) PRIMARY KEY,
+                    window_start TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                    count INTEGER NOT NULL
+                );
+            """))
+            db.session.execute(sa_text(f'CREATE INDEX IF NOT EXISTS idx_rl_window ON {RATE_TABLE}(window_start);'))
+            db.session.commit()
+        else:
+            db.session.execute(sa_text(f"""
+                CREATE TABLE IF NOT EXISTS {RATE_TABLE} (
+                    key TEXT PRIMARY KEY,
+                    window_start DATETIME NOT NULL,
+                    count INTEGER NOT NULL
+                );
+            """))
+            db.session.execute(sa_text(f'CREATE INDEX IF NOT EXISTS idx_rl_window ON {RATE_TABLE}(window_start);'))
+            db.session.commit()
     except Exception as e:
         db.session.rollback()
         print(f"[schema][ERROR] {e}\n{traceback.format_exc()}")
 
 with app.app_context():
     ensure_schema()
+
+def _rl_upsert_and_get_count(key: str, window_start: datetime) -> Optional[int]:
+    """Zwiększa licznik i zwraca count w bieżącym buckecie. Błąd ⇒ None (nie blokujemy ruchu przy awarii)."""
+    try:
+        if _db_kind() == "postgres":
+            res = db.session.execute(
+                sa_text(f"""
+                    INSERT INTO {RATE_TABLE} (key, window_start, count)
+                    VALUES (:key, :ws, 1)
+                    ON CONFLICT (key)
+                    DO UPDATE SET count = {RATE_TABLE}.count + 1
+                    RETURNING count;
+                """),
+                {"key": key, "ws": window_start},
+            ).fetchone()
+            db.session.commit()
+            return int(res[0]) if res else 1
+        else:
+            # SQLite: spróbuj UPDATE → jeśli nic nie zaktualizowano, zrób INSERT; na końcu SELECT
+            upd = db.session.execute(
+                sa_text(f"UPDATE {RATE_TABLE} SET count = count + 1 WHERE key = :key"),
+                {"key": key},
+            )
+            if upd.rowcount == 0:
+                try:
+                    db.session.execute(
+                        sa_text(f"INSERT INTO {RATE_TABLE} (key, window_start, count) VALUES (:key, :ws, 1)"),
+                        {"key": key, "ws": window_start},
+                    )
+                except Exception:
+                    # wyścig? spróbuj ponownie UPDATE
+                    db.session.execute(
+                        sa_text(f"UPDATE {RATE_TABLE} SET count = count + 1 WHERE key = :key"),
+                        {"key": key},
+                    )
+            db.session.commit()
+            row = db.session.execute(
+                sa_text(f"SELECT count FROM {RATE_TABLE} WHERE key = :key"),
+                {"key": key},
+            ).fetchone()
+            return int(row[0]) if row else 1
+    except Exception as e:
+        db.session.rollback()
+        print(f"[ratelimit][ERROR] {e}\n{traceback.format_exc()}")
+        return None
+
+def _ratelimit(scope: str, ident: Optional[str], limit: int, window_sec: int) -> Tuple[bool, Optional[Dict]]:
+    """Zlicza żądania; True=OK, False=zablokuj. Zwraca też payload z informacją o retry."""
+    if not ident:
+        return True, None
+    try:
+        ws = _bucket_start(window_sec)
+        key = f"{scope}:{ident}:{int(ws.timestamp())}"
+        count = _rl_upsert_and_get_count(key, ws)
+        if count is None:
+            return True, None  # awaria licznika nie blokuje
+        if count > limit:
+            retry_in = window_sec - (int(time.time()) % window_sec) + 1
+            return False, {
+                "ok": False, "error": "rate_limited",
+                "scope": scope, "limit": limit, "window_sec": window_sec,
+                "retry_in": retry_in
+            }
+        return True, None
+    except Exception as e:
+        print(f"[ratelimit][FALLBACK-ALLOW] {e}")
+        return True, None
 
 def serialize_message(m: "Message") -> Dict[str, object]:
     return {
@@ -120,13 +237,11 @@ def serialize_message(m: "Message") -> Dict[str, object]:
     }
 
 # ───────────────────────── CORS ─────────────────────────
-# dozwolone originy: prod + dev; regex obsługuje subdomeny
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     re.compile(r"^https:\/\/([a-z0-9-]+\.)?jackqs\.ai$"),
     re.compile(r"^https:\/\/([a-z0-9-]+\.)?jackqs-frontend\.pages\.dev$"),
 ]
-
 CORS(app, resources={
     r"/api/*": {
         "origins": CORS_ALLOWED_ORIGINS,
@@ -238,16 +353,24 @@ def routes_list():
 # ─────────── /api/history — ORM + RAW SQL fallback ───────
 @app.route("/api/history", methods=["GET"])
 def history_db():
-    args = request.args
+    # Rate-limit (IP + user_id jeśli jest)
+    ip = _client_ip()
+    ok_ip, pay = _ratelimit("ip", ip, *RATE_LIMIT_IP)
+    if not ok_ip: return jsonify(pay), 429
+    user_id_for_rl = (request.args.get("user_id") or "").strip()
+    if user_id_for_rl:
+        ok_user, pay2 = _ratelimit("user", user_id_for_rl, *RATE_LIMIT_USER)
+        if not ok_user: return jsonify(pay2), 429
 
+    args = request.args
     user_id    = _clip(args.get("user_id", ""), 64)
     session_id = _clip(args.get("session_id", ""), 64)
     role       = (args.get("role") or "").strip().lower()
     search     = (args.get("search") or "").strip()
 
-    def _to_int(v: str, default: int, lo: int, hi: int) -> int:
+    def _to_int(v: str, d: int, lo: int, hi: int) -> int:
         try: x = int(v)
-        except Exception: x = default
+        except Exception: x = d
         return max(lo, min(hi, x))
 
     limit  = _to_int(args.get("limit", ""), 50, 1, 200)
@@ -271,12 +394,8 @@ def history_db():
         if since_ts is not None: q = q.filter(Message.timestamp >= since_ts)
         if until_ts is not None: q = q.filter(Message.timestamp <= until_ts)
         if search: q = q.filter(Message.content.ilike(f"%{search}%"))
-
-        if order == "asc":
-            q = q.order_by(Message.timestamp.asc(), Message.id.asc())
-        else:
-            q = q.order_by(Message.timestamp.desc(), Message.id.desc())
-
+        if order == "asc": q = q.order_by(Message.timestamp.asc(), Message.id.asc())
+        else:              q = q.order_by(Message.timestamp.desc(), Message.id.desc())
         rows = q.offset(offset).limit(limit + 1).all()
         items = [serialize_message(m) for m in rows]
         has_more = len(items) > limit
@@ -285,7 +404,7 @@ def history_db():
     except Exception as e:
         print(f"[history][ORM-ERROR] {e}\n{traceback.format_exc()}")
 
-    # 2) RAW SQL fallback (parametryzowany)
+    # 2) RAW SQL fallback
     try:
         table = "public.message" if _db_kind() == "postgres" else "message"
         where = []
@@ -303,10 +422,8 @@ def history_db():
         if search:
             like = "ILIKE" if _db_kind() == "postgres" else "LIKE"
             where.append(f"content {like} :search"); params["search"] = f"%{search}%"
-
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         order_sql = "ORDER BY timestamp DESC, id DESC" if order != "asc" else "ORDER BY timestamp ASC, id ASC"
-
         sql = f"""
             SELECT id, role, content, timestamp, user_id, session_id
             FROM {table}
@@ -316,7 +433,6 @@ def history_db():
         """
         params["limit_plus"] = int(limit + 1)
         params["offset"] = int(offset)
-
         res = db.session.execute(sa_text(sql), params).fetchall()
         items = []
         for row in res:
@@ -336,6 +452,11 @@ def history_db():
 # ─────── /api/history/recent — ostatnie N bez filtrów ────
 @app.route("/api/history/recent", methods=["GET"])
 def history_recent():
+    # prosty rate-limit po IP
+    ip = _client_ip()
+    ok_ip, pay = _ratelimit("ip", ip, *RATE_LIMIT_IP)
+    if not ok_ip: return jsonify(pay), 429
+
     try:
         limit = int(request.args.get("limit", "10"))
     except Exception:
@@ -352,9 +473,18 @@ def history_recent():
 # ─────────────────────── /api/chat ────────────────────────
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    data = request.get_json(silent=True) or {}
+    # Rate-limit (IP + user jeśli podany)
+    ip = _client_ip()
+    ok_ip, pay = _ratelimit("ip", ip, *RATE_LIMIT_IP)
+    if not ok_ip: return jsonify(pay), 429
 
-    ok_ts, details = verify_turnstile(data.get("cf_turnstile_token"), request.remote_addr)
+    data = request.get_json(silent=True) or {}
+    user_id    = _clip((data.get("user_id") or ""), 64)
+    if user_id:
+        ok_user, pay2 = _ratelimit("user", user_id, *RATE_LIMIT_USER)
+        if not ok_user: return jsonify(pay2), 429
+
+    ok_ts, details = verify_turnstile(data.get("cf_turnstile_token"), ip)
     if not ok_ts:
         return jsonify({"ok": False, "error": "turnstile_failed", "details": details}), 403
 
@@ -362,9 +492,7 @@ def chat():
     if not user_message:
         return jsonify({"ok": False, "error": "message is required"}), 400
 
-    user_id    = _clip(data.get("user_id"), 64)
     session_id = _clip(data.get("session_id"), 64)
-
     reply = f"Echo: {user_message}"
 
     if openai_client and OPENAI_API_KEY:
@@ -427,7 +555,6 @@ def chat():
 # ────────────────────── Local run (dev) ───────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
 
 
 
