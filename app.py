@@ -1,7 +1,7 @@
 # app.py
 from __future__ import annotations
 
-import os, json, time, requests
+import os, time, requests
 from typing import Optional, Dict
 from datetime import datetime
 
@@ -9,11 +9,12 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy import text as sa_text
-
+from dateutil import parser as dtparser
 from dotenv import load_dotenv
+
 load_dotenv()
 
-# --------------------------- Flask ---------------------------
+# ───────────────────────── Flask ─────────────────────────
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 try:
@@ -21,14 +22,14 @@ try:
 except Exception:
     pass
 
-# Build info (do szybkiego sprawdzenia świeżości deployu)
+# Info o buildzie (szybkie sprawdzenie świeżości deployu)
 BUILD = {
     "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("COMMIT_SHA") or "dev",
     "boot_ts": int(time.time()),
 }
 
-# ------------------------ Database --------------------------
-# MUSI być ustawione w Railway: DATABASE_URL=postgresql+psycopg2://...?...sslmode=require
+# ──────────────────────── Database ───────────────────────
+# W Railway: DATABASE_URL=postgresql+psycopg2://...?...sslmode=require
 db_url = os.getenv("DATABASE_URL", "sqlite:///app.db")
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -56,13 +57,13 @@ def serialize_message(m: "Message") -> Dict[str, object]:
         "session_id": m.session_id,
     }
 
-# -------------------------- CORS ----------------------------
-# Na czas testów szeroko; później zawężamy do *.jackqs.ai i lokalnych devów.
+# ───────────────────────── CORS ─────────────────────────
+# Testowo szeroko; później zawęzimy do *.jackqs.ai i lokalnych dev originów
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ------------------------ Turnstile -------------------------
+# ─────────────────────── Turnstile ───────────────────────
 TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET_KEY", "")
-BYPASS_TURNSTILE_DEV = os.getenv("BYPASS_TURNSTILE_DEV", "0")  # "1" = pomiń weryfikację
+BYPASS_TURNSTILE_DEV = os.getenv("BYPASS_TURNSTILE_DEV", "0")  # "1" = pomijaj weryfikację
 
 def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> tuple[bool, dict]:
     # DEV bypass lub brak secretu -> nie blokuj
@@ -83,7 +84,7 @@ def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> tuple[bool,
     except Exception as e:
         return False, {"error": str(e)}
 
-# -------------------------- OpenAI --------------------------
+# ───────────────────────── OpenAI ────────────────────────
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("openai_api_key")
 try:
@@ -92,13 +93,18 @@ try:
 except Exception:
     openai_client = None  # brak klucza nie powinien blokować startu
 
-# ------------------------- Helpers --------------------------
+# ─────────────────────── Helpers ─────────────────────────
 def _extract_message(data: dict) -> Optional[str]:
     for k in ("message", "text", "prompt", "query", "q"):
         v = data.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
+
+def _clip(s: Optional[str], n: int) -> Optional[str]:
+    if not s: return s
+    s = str(s).strip()
+    return s[:n]
 
 def _db_status() -> str:
     try:
@@ -107,20 +113,14 @@ def _db_status() -> str:
     except Exception:
         return "error"
 
-# -------------------------- Routes --------------------------
+# ─────────────────────── Routes ──────────────────────────
 @app.route("/")
 def root():
     return "Jack backend – OK. Użyj /api/health"
 
 @app.route("/api/health")
 def health():
-    # lekki healthcheck + minimalny status DB + build info
-    return jsonify({
-        "ok": True,
-        "time": int(time.time()),
-        "db": _db_status(),
-        "build": BUILD,
-    })
+    return jsonify({"ok": True, "time": int(time.time()), "db": _db_status(), "build": BUILD})
 
 @app.route("/api/db-ping")
 def db_ping():
@@ -132,26 +132,66 @@ def db_ping():
 
 @app.route("/api/routes")
 def routes_list():
-    # Podgląd tras głównej appki (bez rozróżniania legacy)
     rules = sorted([str(r.rule) for r in app.url_map.iter_rules()])
     return jsonify(rules)
 
+# ─────────── /api/history — wersja DB z filtrami ─────────
 @app.route("/api/history", methods=["GET"])
-def history_min():
+def history_db():
     """
-    Sanity endpoint — na teraz zwraca pustą listę.
-    W następnym kroku podmienimy na wersję z SQLAlchemy i filtrami.
+    Query params:
+      user_id, session_id, role(user|jack), search, since_ts, until_ts,
+      order(asc|desc=default), limit(1..200=50), offset(>=0=0)
     """
-    # opcjonalnie: przyjmij parametry, żeby frontend mógł już wołać /api/history?user_id=...
-    _user_id = request.args.get("user_id", "")
-    _session = request.args.get("session_id", "")
-    _limit = request.args.get("limit", "")
-    _offset = request.args.get("offset", "")
-    return jsonify([])
+    args = request.args
 
+    user_id    = _clip(args.get("user_id", ""), 64)
+    session_id = _clip(args.get("session_id", ""), 64)
+    role       = (args.get("role") or "").strip().lower()
+    search     = (args.get("search") or "").strip()
+
+    def _to_int(v: str, default: int, lo: int, hi: int) -> int:
+        try: x = int(v)
+        except Exception: x = default
+        return max(lo, min(hi, x))
+
+    limit  = _to_int(args.get("limit", ""), 50, 1, 200)
+    offset = _to_int(args.get("offset", ""), 0, 0, 10_000_000)
+    order  = (args.get("order") or "desc").lower()
+
+    def _parse_ts(s: str):
+        if not s: return None
+        try: return dtparser.parse(s)
+        except Exception: return None
+
+    since_ts = _parse_ts(args.get("since_ts", ""))
+    until_ts = _parse_ts(args.get("until_ts", ""))
+
+    q = Message.query
+    if user_id:    q = q.filter(Message.user_id == user_id)
+    if session_id: q = q.filter(Message.session_id == session_id)
+    if role in ("user", "jack"): q = q.filter(Message.role == role)
+    if since_ts is not None: q = q.filter(Message.timestamp >= since_ts)
+    if until_ts is not None: q = q.filter(Message.timestamp <= until_ts)
+    if search: q = q.filter(Message.content.ilike(f"%{search}%"))
+
+    if order == "asc":
+        q = q.order_by(Message.timestamp.asc(), Message.id.asc())
+    else:
+        q = q.order_by(Message.timestamp.desc(), Message.id.desc())
+
+    items = [serialize_message(m) for m in q.offset(offset).limit(limit + 1).all()]
+    has_more = len(items) > limit
+    if has_more:
+        items = items[:limit]
+
+    return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more})
+
+# ─────────────────────── /api/chat ────────────────────────
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
+
     ok_ts, details = verify_turnstile(data.get("cf_turnstile_token"), request.remote_addr)
     if not ok_ts:
         return jsonify({"ok": False, "error": "turnstile_failed", "details": details}), 403
@@ -160,7 +200,10 @@ def chat():
     if not user_message:
         return jsonify({"error": "message is required"}), 400
 
-    # prosta odpowiedź, a jeśli jest OpenAI – użyj
+    # identyfikacja rozmowy (pozwala filtrować historię)
+    user_id    = _clip(data.get("user_id"), 64)
+    session_id = _clip(data.get("session_id"), 64)
+
     reply = f"Echo: {user_message}"
     if openai_client and OPENAI_API_KEY:
         try:
@@ -176,17 +219,17 @@ def chat():
         except Exception as e:
             reply = f"(fallback) {reply} – openai_error: {e}"
 
-    # best-effort zapis do DB (bez twardego faila, żeby nie blokować odpowiedzi)
+    # zapis do DB (best-effort)
     try:
-        db.session.add(Message(role="user", content=user_message))
-        db.session.add(Message(role="jack", content=reply))
+        db.session.add(Message(role="user", content=user_message, user_id=user_id, session_id=session_id))
+        db.session.add(Message(role="jack", content=reply,       user_id=user_id, session_id=session_id))
         db.session.commit()
     except Exception:
         db.session.rollback()
 
-    return jsonify({"reply": reply})
+    return jsonify({"ok": True, "reply": reply, "build": BUILD})
 
-# ------------------------- Run local ------------------------
+# ────────────────────── Local run (dev) ───────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
 
