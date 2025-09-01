@@ -1,7 +1,7 @@
 # app.py
 from __future__ import annotations
 
-import os, time, requests
+import os, time, requests, traceback
 from typing import Optional, Dict
 from datetime import datetime
 
@@ -22,7 +22,6 @@ try:
 except Exception:
     pass
 
-# Build info
 BUILD = {
     "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("COMMIT_SHA") or "dev",
     "boot_ts": int(time.time()),
@@ -35,8 +34,14 @@ app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
+def _db_scheme_info(uri: str) -> Dict[str, str]:
+    scheme = (uri.split("://", 1)[0] if "://" in uri else uri).lower()
+    kind = "postgres" if "postgres" in scheme else ("sqlite" if "sqlite" in scheme else scheme)
+    return {"kind": kind, "scheme": scheme}
+
+# ✅ UPROSZCZENIE: używamy małej litery „message”, bez cudzysłowu (bezpieczne w Postgresie i SQLite).
 class Message(db.Model):
-    __tablename__ = "Message"
+    __tablename__ = "message"
     id         = db.Column(db.Integer, primary_key=True)
     role       = db.Column(db.String(10))      # 'user' | 'jack'
     content    = db.Column(db.Text)
@@ -44,31 +49,17 @@ class Message(db.Model):
     user_id    = db.Column(db.String(64), index=True)
     session_id = db.Column(db.String(64), index=True)
 
-def _db_scheme_info(uri: str) -> Dict[str, str]:
-    scheme = (uri.split("://", 1)[0] if "://" in uri else uri).lower()
-    kind = "postgres" if "postgres" in scheme else ("sqlite" if "sqlite" in scheme else scheme)
-    return {"kind": kind, "scheme": scheme}
-
+# Twarda migracja — tworzy tabelę „message”, jeżeli brakuje.
 def ensure_schema() -> None:
-    """
-    Twarda migracja: tworzy tabelę Message + indeksy, jeśli brakuje (Postgres/SQLite).
-    Bezpiecznie działa również przy wielokrotnym wywołaniu.
-    """
     try:
-        # Sprawdź istnienie tabeli (Postgres)
-        exists = None
-        try:
-            res = db.session.execute(sa_text("SELECT to_regclass('\"Message\"');"))
+        if "postgres" in db_url:
+            # sprawdź istnienie public.message
+            res = db.session.execute(sa_text("SELECT to_regclass('public.message');"))
             exists = res.scalar()
-        except Exception:
-            # SQLite fallback
-            pass
-
-        if not exists:
-            if "postgres" in db_url:
+            if not exists:
                 db.session.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS "Message" (
-                        id SERIAL PRIMARY KEY,
+                    CREATE TABLE IF NOT EXISTS public.message (
+                        id BIGSERIAL PRIMARY KEY,
                         role VARCHAR(10),
                         content TEXT,
                         timestamp TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
@@ -76,52 +67,49 @@ def ensure_schema() -> None:
                         session_id VARCHAR(64)
                     );
                 """))
-                db.session.execute(sa_text("""CREATE INDEX IF NOT EXISTS idx_message_ts ON "Message"(timestamp);"""))
-                db.session.execute(sa_text("""CREATE INDEX IF NOT EXISTS idx_message_user ON "Message"(user_id);"""))
-                db.session.execute(sa_text("""CREATE INDEX IF NOT EXISTS idx_message_session ON "Message"(session_id);"""))
-            else:
-                # SQLite – kompatybilny DDL
-                db.session.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS "Message" (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        role TEXT,
-                        content TEXT,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        user_id TEXT,
-                        session_id TEXT
-                    );
-                """))
-                db.session.execute(sa_text("""CREATE INDEX IF NOT EXISTS idx_message_ts ON "Message"(timestamp);"""))
-                db.session.execute(sa_text("""CREATE INDEX IF NOT EXISTS idx_message_user ON "Message"(user_id);"""))
-                db.session.execute(sa_text("""CREATE INDEX IF NOT EXISTS idx_message_session ON "Message"(session_id);"""))
+                db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_ts ON public.message(timestamp);"))
+                db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_user ON public.message(user_id);"))
+                db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_session ON public.message(session_id);"))
+                db.session.commit()
+        else:
+            # SQLite
+            db.session.execute(sa_text("""
+                CREATE TABLE IF NOT EXISTS message (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    role TEXT,
+                    content TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    user_id TEXT,
+                    session_id TEXT
+                );
+            """))
+            db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_ts ON message(timestamp);"))
+            db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_user ON message(user_id);"))
+            db.session.execute(sa_text("CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id);"))
             db.session.commit()
     except Exception as e:
         db.session.rollback()
-        print(f"[schema][ERROR] {e}")
+        print(f"[schema][ERROR] {e}\n{traceback.format_exc()}")
 
 with app.app_context():
-    # Zamiast liczyć na create_all pod poolerem – wymuś istnienie tabeli
     ensure_schema()
 
 def serialize_message(m: "Message") -> Dict[str, object]:
     return {
-        "id": m.id,
-        "role": m.role,
-        "content": m.content,
+        "id": m.id, "role": m.role, "content": m.content,
         "timestamp": (m.timestamp.isoformat() if m.timestamp else None),
-        "user_id": m.user_id,
-        "session_id": m.session_id,
+        "user_id": m.user_id, "session_id": m.session_id,
     }
 
 # ───────────────────────── CORS ─────────────────────────
-CORS(app, resources={r"/api/*": {"origins": "*"}})  # zawęzimy później
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # zawęzimy po testach
 
 # ─────────────────────── Turnstile ───────────────────────
 TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET_KEY", "")
 BYPASS_TURNSTILE_DEV = os.getenv("BYPASS_TURNSTILE_DEV", "0")  # "1" = pomijaj weryfikację
 
 def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> tuple[bool, dict]:
-    if BYPASS_TURNSTILE_DEV == "1":
+    if BYPASS_TURNSTILE_DEV == "1":  # dev bypass
         return True, {"dev": "bypass"}
     if not TURNSTILE_SECRET:
         return True, {"dev": "no_secret"}
@@ -175,10 +163,8 @@ def root():
 @app.route("/api/health")
 def health():
     return jsonify({
-        "ok": True,
-        "time": int(time.time()),
-        "db": _db_status(),
-        "db_url": _db_scheme_info(db_url),
+        "ok": True, "time": int(time.time()),
+        "db": _db_status(), "db_url": _db_scheme_info(db_url),
         "build": BUILD
     })
 
@@ -189,6 +175,26 @@ def db_ping():
         return jsonify({"db": "ok"})
     except Exception as e:
         return jsonify({"db": "error", "error": str(e)}), 500
+
+@app.route("/api/db-debug")
+def db_debug():
+    """Prosty podgląd tabel i liczników — pomaga przy 500-kach."""
+    out = {"kind": _db_scheme_info(db_url)["kind"], "tables": []}
+    try:
+        if "postgres" in db_url:
+            rows = db.session.execute(sa_text("SELECT schemaname, tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename;")).fetchall()
+            out["tables"] = [{"schema":r[0], "table":r[1]} for r in rows]
+            # licznik dla message (jeśli istnieje)
+            cnt = db.session.execute(sa_text("SELECT COUNT(*) FROM public.message;")).scalar()
+            out["message_count"] = int(cnt)
+        else:
+            rows = db.session.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")).fetchall()
+            out["tables"] = [{"table": r[0]} for r in rows]
+            cnt = db.session.execute(sa_text("SELECT COUNT(*) FROM message;")).scalar()
+            out["message_count"] = int(cnt)
+        return jsonify({"ok": True, "db": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "db": out}), 500
 
 @app.route("/api/routes")
 def routes_list():
@@ -243,7 +249,7 @@ def history_db():
 
         return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more})
     except Exception as e:
-        print(f"[history][ERROR] {e}")
+        print(f"[history][ERROR] {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "error": "history_failed"}), 500
 
 # ─────── /api/history/recent — ostatnie N bez filtrów ────
@@ -259,7 +265,7 @@ def history_recent():
         items = [serialize_message(m) for m in q.all()]
         return jsonify({"ok": True, "items": items, "limit": limit})
     except Exception as e:
-        print(f"[recent][ERROR] {e}")
+        print(f"[recent][ERROR] {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "error": "recent_failed"}), 500
 
 # ─────────────────────── /api/chat ────────────────────────
@@ -275,14 +281,11 @@ def chat():
     if not user_message:
         return jsonify({"ok": False, "error": "message is required"}), 400
 
-    # Identyfikatory do historii
     user_id    = _clip(data.get("user_id"), 64)
     session_id = _clip(data.get("session_id"), 64)
 
-    # Fallback odpowiedź
     reply = f"Echo: {user_message}"
 
-    # OpenAI (SDK 1.x)
     if openai_client and OPENAI_API_KEY:
         try:
             resp = openai_client.chat.completions.create(
@@ -297,7 +300,7 @@ def chat():
         except Exception as e:
             reply = f"(fallback) {reply} – openai_error: {e}"
 
-    # Awaryjnie upewnij się, że tabela istnieje (gdyby startowy ensure_schema() nie zdążył)
+    # Upewnij się, że tabela istnieje
     ensure_schema()
 
     saved = False
@@ -307,7 +310,7 @@ def chat():
         db.session.commit()
         saved = True
     except Exception as e:
-        print(f"[chat][DB-ERROR] {e}")
+        print(f"[chat][DB-ERROR] {e}\n{traceback.format_exc()}")
         db.session.rollback()
 
     return jsonify({"ok": True, "reply": reply, "saved": saved, "build": BUILD})
