@@ -36,7 +36,7 @@ db = SQLAlchemy(app)
 def _db_kind() -> str:
     s = db_url.split("://", 1)[0].lower()
     if "postgres" in s: return "postgres"
-    if "sqlite" in s: return "sqlite"
+    if "sqlite"   in s: return "sqlite"
     return s
 
 def _db_scheme_info(uri: str) -> Dict[str, str]:
@@ -44,7 +44,7 @@ def _db_scheme_info(uri: str) -> Dict[str, str]:
     kind = "postgres" if "postgres" in scheme else ("sqlite" if "sqlite" in scheme else scheme)
     return {"kind": kind, "scheme": scheme}
 
-# ORM używa małoliterowej tabeli `message`
+# ORM korzysta z małoliterowej tabeli `message`
 class Message(db.Model):
     __tablename__ = "message"
     id         = db.Column(db.Integer, primary_key=True)
@@ -56,7 +56,7 @@ class Message(db.Model):
 
 def ensure_schema() -> None:
     """
-    Tworzy public.message jeśli brak, dodaje kolumny user_id/session_id i indeksy.
+    Tworzy public.message, dodaje kolumny user_id/session_id i indeksy.
     Jeśli istnieje stara public."Message" a nie ma public.message → tworzy message i kopiuje dane.
     """
     try:
@@ -80,11 +80,9 @@ def ensure_schema() -> None:
                     """))
                 db.session.commit()
 
-            # Kolumny (idempotentnie)
             db.session.execute(sa_text('ALTER TABLE public.message ADD COLUMN IF NOT EXISTS user_id VARCHAR(64);'))
             db.session.execute(sa_text('ALTER TABLE public.message ADD COLUMN IF NOT EXISTS session_id VARCHAR(64);'))
 
-            # Indeksy
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_ts ON public.message(timestamp);'))
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_user ON public.message(user_id);'))
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_session ON public.message(session_id);'))
@@ -127,7 +125,7 @@ TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET_KEY", "")
 BYPASS_TURNSTILE_DEV = os.getenv("BYPASS_TURNSTILE_DEV", "0")
 
 def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> tuple[bool, dict]:
-    if BYPASS_TURNSTILE_DEV == "1":  # dev bypass
+    if BYPASS_TURNSTILE_DEV == "1":
         return True, {"dev": "bypass"}
     if not TURNSTILE_SECRET:
         return True, {"dev": "no_secret"}
@@ -220,7 +218,7 @@ def routes_list():
     rules = sorted([str(r.rule) for r in app.url_map.iter_rules()])
     return jsonify(rules)
 
-# ─────────── /api/history — wersja DB z filtrami ─────────
+# ─────────── /api/history — ORM + RAW SQL fallback ───────
 @app.route("/api/history", methods=["GET"])
 def history_db():
     args = request.args
@@ -247,6 +245,7 @@ def history_db():
     since_ts = _parse_ts(args.get("since_ts", ""))
     until_ts = _parse_ts(args.get("until_ts", ""))
 
+    # 1) ORM
     try:
         q = Message.query
         if user_id:    q = q.filter(Message.user_id == user_id)
@@ -261,14 +260,60 @@ def history_db():
         else:
             q = q.order_by(Message.timestamp.desc(), Message.id.desc())
 
-        items = [serialize_message(m) for m in q.offset(offset).limit(limit + 1).all()]
+        rows = q.offset(offset).limit(limit + 1).all()
+        items = [serialize_message(m) for m in rows]
         has_more = len(items) > limit
-        if has_more:
-            items = items[:limit]
-
+        if has_more: items = items[:limit]
         return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more})
     except Exception as e:
-        print(f"[history][ERROR] {e}\n{traceback.format_exc()}")
+        print(f"[history][ORM-ERROR] {e}\n{traceback.format_exc()}")
+
+    # 2) RAW SQL fallback (parametryzowany)
+    try:
+        table = "public.message" if _db_kind() == "postgres" else "message"
+        where = []
+        params: Dict[str, object] = {}
+        if user_id:
+            where.append("user_id = :user_id"); params["user_id"] = user_id
+        if session_id:
+            where.append("session_id = :session_id"); params["session_id"] = session_id
+        if role in ("user", "jack"):
+            where.append("role = :role"); params["role"] = role
+        if since_ts is not None:
+            where.append("timestamp >= :since_ts"); params["since_ts"] = since_ts
+        if until_ts is not None:
+            where.append("timestamp <= :until_ts"); params["until_ts"] = until_ts
+        if search:
+            like = "ILIKE" if _db_kind() == "postgres" else "LIKE"
+            where.append(f"content {like} :search"); params["search"] = f"%{search}%"
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        order_sql = "ORDER BY timestamp DESC, id DESC" if order != "asc" else "ORDER BY timestamp ASC, id ASC"
+
+        sql = f"""
+            SELECT id, role, content, timestamp, user_id, session_id
+            FROM {table}
+            {where_sql}
+            {order_sql}
+            LIMIT :limit_plus OFFSET :offset
+        """
+        params["limit_plus"] = int(limit + 1)
+        params["offset"] = int(offset)
+
+        res = db.session.execute(sa_text(sql), params).fetchall()
+        items = []
+        for row in res:
+            m = row._mapping if hasattr(row, "_mapping") else row
+            items.append({
+                "id": m["id"], "role": m["role"], "content": m["content"],
+                "timestamp": (m["timestamp"].isoformat() if m["timestamp"] else None),
+                "user_id": m.get("user_id"), "session_id": m.get("session_id"),
+            })
+        has_more = len(items) > limit
+        if has_more: items = items[:limit]
+        return jsonify({"ok": True, "items": items, "limit": limit, "offset": offset, "has_more": has_more})
+    except Exception as e:
+        print(f"[history][RAW-ERROR] {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "error": "history_failed"}), 500
 
 # ─────── /api/history/recent — ostatnie N bez filtrów ────
@@ -319,12 +364,12 @@ def chat():
         except Exception as e:
             reply = f"(fallback) {reply} – openai_error: {e}"
 
-    ensure_schema()  # upewnij się, że kolumny istnieją
+    ensure_schema()
 
     saved = False
     db_error = None
 
-    # 1) Próba ORM
+    # 1) ORM insert
     try:
         db.session.add(Message(role="user", content=user_message, user_id=user_id, session_id=session_id))
         db.session.add(Message(role="jack", content=reply,       user_id=user_id, session_id=session_id))
@@ -335,7 +380,7 @@ def chat():
         db_error = f"orm_insert_failed: {e1}"
         print(f"[chat][DB-ERROR][ORM] {e1}\n{traceback.format_exc()}")
 
-        # 2) Awaryjna próba INSERT SQL
+        # 2) RAW SQL fallback insert
         try:
             if _db_kind() == "postgres":
                 db.session.execute(
