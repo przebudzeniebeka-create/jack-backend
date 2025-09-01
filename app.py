@@ -11,6 +11,8 @@ from flask_cors import CORS
 from sqlalchemy import text as sa_text
 from dateutil import parser as dtparser
 from dotenv import load_dotenv
+import re
+
 
 load_dotenv()
 
@@ -118,7 +120,22 @@ def serialize_message(m: "Message") -> Dict[str, object]:
     }
 
 # ───────────────────────── CORS ─────────────────────────
-CORS(app, resources={r"/api/*": {"origins": "*"}})  # zawęzimy później
+# dozwolone originy: prod + dev; regex obsługuje subdomeny
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    re.compile(r"^https:\/\/([a-z0-9-]+\.)?jackqs\.ai$"),
+    re.compile(r"^https:\/\/([a-z0-9-]+\.)?jackqs-frontend\.pages\.dev$"),
+]
+
+CORS(app, resources={
+    r"/api/*": {
+        "origins": CORS_ALLOWED_ORIGINS,
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": False,
+        "max_age": 600,
+    }
+})
 
 # ─────────────────────── Turnstile ───────────────────────
 TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET_KEY", "")
