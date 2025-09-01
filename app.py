@@ -33,12 +33,18 @@ app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
+def _db_kind() -> str:
+    s = db_url.split("://", 1)[0].lower()
+    if "postgres" in s: return "postgres"
+    if "sqlite" in s: return "sqlite"
+    return s
+
 def _db_scheme_info(uri: str) -> Dict[str, str]:
     scheme = (uri.split("://", 1)[0] if "://" in uri else uri).lower()
     kind = "postgres" if "postgres" in scheme else ("sqlite" if "sqlite" in scheme else scheme)
     return {"kind": kind, "scheme": scheme}
 
-# ORM używa małoliterowej tabeli `message` (bez cudzysłowów)
+# ORM używa małoliterowej tabeli `message`
 class Message(db.Model):
     __tablename__ = "message"
     id         = db.Column(db.Integer, primary_key=True)
@@ -50,14 +56,11 @@ class Message(db.Model):
 
 def ensure_schema() -> None:
     """
-    - Tworzy public.message, jeśli nie ma.
-    - Dodaje kolumny user_id/session_id, jeśli brakuje (ALTER TABLE IF NOT EXISTS).
-    - Zakłada indeksy.
-    - Jeśli istnieje stara public."Message" a nie istnieje public.message → tworzy message i kopiuje dane.
+    Tworzy public.message jeśli brak, dodaje kolumny user_id/session_id i indeksy.
+    Jeśli istnieje stara public."Message" a nie ma public.message → tworzy message i kopiuje dane.
     """
     try:
-        if "postgres" in db_url:
-            # Sprawdź istnienie tabel
+        if _db_kind() == "postgres":
             exists_message = db.session.execute(sa_text("SELECT to_regclass('public.message');")).scalar()
             exists_Message = db.session.execute(sa_text("SELECT to_regclass('public.\"Message\"');")).scalar()
 
@@ -70,28 +73,24 @@ def ensure_schema() -> None:
                         timestamp TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
                     );
                 """))
-                # Jeśli mamy starą "Message" → skopiuj (bez id, pozwól na nowe)
                 if exists_Message:
                     db.session.execute(sa_text("""
                         INSERT INTO public.message (role, content, timestamp)
                         SELECT role, content, timestamp FROM public."Message";
                     """))
                 db.session.commit()
-                exists_message = True  # już jest
 
-            # Dodaj brakujące kolumny (bezpiecznie)
+            # Kolumny (idempotentnie)
             db.session.execute(sa_text('ALTER TABLE public.message ADD COLUMN IF NOT EXISTS user_id VARCHAR(64);'))
             db.session.execute(sa_text('ALTER TABLE public.message ADD COLUMN IF NOT EXISTS session_id VARCHAR(64);'))
 
-            # Indeksy (bezpiecznie)
+            # Indeksy
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_ts ON public.message(timestamp);'))
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_user ON public.message(user_id);'))
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_session ON public.message(session_id);'))
-
             db.session.commit()
 
-        else:
-            # SQLite
+        else:  # SQLite
             db.session.execute(sa_text("""
                 CREATE TABLE IF NOT EXISTS message (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +105,6 @@ def ensure_schema() -> None:
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_user ON message(user_id);'))
             db.session.execute(sa_text('CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id);'))
             db.session.commit()
-
     except Exception as e:
         db.session.rollback()
         print(f"[schema][ERROR] {e}\n{traceback.format_exc()}")
@@ -126,7 +124,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})  # zawęzimy później
 
 # ─────────────────────── Turnstile ───────────────────────
 TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET_KEY", "")
-BYPASS_TURNSTILE_DEV = os.getenv("BYPASS_TURNSTILE_DEV", "0")  # "1" = pomijaj weryfikację
+BYPASS_TURNSTILE_DEV = os.getenv("BYPASS_TURNSTILE_DEV", "0")
 
 def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> tuple[bool, dict]:
     if BYPASS_TURNSTILE_DEV == "1":  # dev bypass
@@ -192,7 +190,7 @@ def health():
 def db_debug():
     out = {"kind": _db_scheme_info(db_url)["kind"], "tables": [], "message_columns": []}
     try:
-        if "postgres" in db_url:
+        if _db_kind() == "postgres":
             rows = db.session.execute(sa_text("""
                 SELECT schemaname, tablename FROM pg_tables
                 WHERE schemaname='public' ORDER BY tablename;
@@ -321,20 +319,48 @@ def chat():
         except Exception as e:
             reply = f"(fallback) {reply} – openai_error: {e}"
 
-    # Gwarancja schematu (kolumny + indeksy)
-    ensure_schema()
+    ensure_schema()  # upewnij się, że kolumny istnieją
 
     saved = False
+    db_error = None
+
+    # 1) Próba ORM
     try:
         db.session.add(Message(role="user", content=user_message, user_id=user_id, session_id=session_id))
         db.session.add(Message(role="jack", content=reply,       user_id=user_id, session_id=session_id))
         db.session.commit()
         saved = True
-    except Exception as e:
-        print(f"[chat][DB-ERROR] {e}\n{traceback.format_exc()}")
+    except Exception as e1:
         db.session.rollback()
+        db_error = f"orm_insert_failed: {e1}"
+        print(f"[chat][DB-ERROR][ORM] {e1}\n{traceback.format_exc()}")
 
-    return jsonify({"ok": True, "reply": reply, "saved": saved, "build": BUILD})
+        # 2) Awaryjna próba INSERT SQL
+        try:
+            if _db_kind() == "postgres":
+                db.session.execute(
+                    sa_text("""
+                        INSERT INTO public.message (role, content, user_id, session_id)
+                        VALUES (:r1, :c1, :u, :s), (:r2, :c2, :u, :s)
+                    """),
+                    {"r1": "user", "c1": user_message, "r2": "jack", "c2": reply, "u": user_id, "s": session_id},
+                )
+            else:
+                db.session.execute(
+                    sa_text("""
+                        INSERT INTO message (role, content, user_id, session_id)
+                        VALUES (:r1, :c1, :u, :s), (:r2, :c2, :u, :s)
+                    """),
+                    {"r1": "user", "c1": user_message, "r2": "jack", "c2": reply, "u": user_id, "s": session_id},
+                )
+            db.session.commit()
+            saved = True
+        except Exception as e2:
+            db.session.rollback()
+            db_error = f"{db_error}; raw_insert_failed: {e2}"
+            print(f"[chat][DB-ERROR][RAW] {e2}\n{traceback.format_exc()}")
+
+    return jsonify({"ok": True, "reply": reply, "saved": saved, "db_error": db_error, "build": BUILD})
 
 # ────────────────────── Local run (dev) ───────────────────
 if __name__ == "__main__":
