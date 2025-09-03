@@ -1,8 +1,8 @@
-# main.py — API z /api/health + /api/chat
+# main.py — /api/health + /api/chat + /api/tts
 from __future__ import annotations
 import os, typing as t
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from openai import OpenAI
@@ -10,15 +10,20 @@ from openai import OpenAI
 # ── ENV ──────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET", "")  # jeśli puste → nie blokuje testów
+TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET", "")  # puste = nie wymaga tokenu (łatwy test)
 
 # CORS: lokalnie + subdomeny jackqs.ai
 FRONTEND_ORIGINS      = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000")
 FRONTEND_ORIGIN_REGEX = os.getenv("FRONTEND_ORIGIN_REGEX", r"https://.*\.jackqs\.ai$")
 allowed_origins = [o.strip() for o in FRONTEND_ORIGINS.split(",") if o.strip()]
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ElevenLabs (TTS)
+ELEVEN_API_KEY     = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVEN_VOICE_ID    = os.getenv("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # fallback
+ELEVEN_VOICE_ID_EN = os.getenv("ELEVEN_VOICE_ID_EN", "")
+ELEVEN_VOICE_ID_PL = os.getenv("ELEVEN_VOICE_ID_PL", "")
 
+client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="JackQS API")
 
 app.add_middleware(
@@ -43,9 +48,13 @@ class ChatResponse(BaseModel):
     text: str
     usage: dict | None = None
 
+class TTSRequest(BaseModel):
+    text: str
+    voice_id: t.Optional[str] = None
+    lang: t.Optional[str] = None   # 'en' lub 'pl'
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def verify_turnstile(token: str | None, remoteip: str | None) -> bool:
-    # Gdy brak SECRET → nie blokujemy (łatwy test). W PROD ustaw SECRET i front musi podać token!
     if not TURNSTILE_SECRET:
         return True
     if not token:
@@ -71,7 +80,6 @@ def health():
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: Request, body: ChatRequest):
-    # Turnstile (lekko: jeśli SECRET pusty → przepuszczamy)
     ip = req.client.host if req.client else None
     if not verify_turnstile(body.turnstile_token, ip):
         raise HTTPException(status_code=403, detail="Turnstile verification failed")
@@ -79,7 +87,6 @@ async def chat(req: Request, body: ChatRequest):
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
 
-    # minimalny system prompt, jeśli brak
     messages = [{"role": m.role, "content": m.content} for m in body.messages]
     if not any(m["role"] == "system" for m in messages):
         messages.insert(0, {"role":"system","content":"You are Jack, concise and kind. Keep replies short and helpful."})
@@ -103,3 +110,36 @@ async def chat(req: Request, body: ChatRequest):
         return ChatResponse(text=text, usage=usage)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI error: {e}")
+
+@app.post("/api/tts")
+def tts(body: TTSRequest):
+    """Zwraca audio/mpeg (ElevenLabs). Jeśli brak klucza – 204 jako fallback."""
+    if not ELEVEN_API_KEY:
+        return Response(status_code=204)
+
+    voice_id = (
+        body.voice_id
+        or (ELEVEN_VOICE_ID_PL if (body.lang == "pl" and ELEVEN_VOICE_ID_PL) else None)
+        or (ELEVEN_VOICE_ID_EN if (body.lang == "en" and ELEVEN_VOICE_ID_EN) else None)
+        or ELEVEN_VOICE_ID
+    )
+
+    try:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {
+            "xi-api-key": ELEVEN_API_KEY,
+            "accept": "audio/mpeg",
+            "content-type": "application/json"
+        }
+        payload = {
+            "text": body.text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        if r.status_code == 200 and r.content:
+            return Response(content=r.content, media_type="audio/mpeg")
+        return Response(status_code=204)  # fallback
+    except Exception:
+        return Response(status_code=204)
+
