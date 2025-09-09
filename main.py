@@ -38,17 +38,12 @@ app.add_middleware(
 RATINGS: list[dict] = []
 
 # ---- Modele ----
-class StartPayload(BaseModel):
-    email: t.Optional[str] = None
-
 class ChatPayload(BaseModel):
-    message: str = Field(..., min_length=1)
-    token: str
-
-class RatePayload(BaseModel):
-    rating: int = Field(..., ge=0, le=10)
-    token: str
-    comment: t.Optional[str] = None
+    # NOWE: obsługujemy oba kształty
+    message: t.Optional[str] = None            # nasz nowy, prosty format
+    messages: t.Optional[list[dict]] = None    # stary format z frontendów (array)
+    token: t.Optional[str] = None              # token z /api/test/start (gdy jest)
+    turnstile_token: t.Optional[str] = None    # ignorujemy w trybie testowym
 
 # ---- Pomocnicze JWT ----
 def issue_token(email: str | None) -> tuple[str, int]:
@@ -97,6 +92,51 @@ def chat(p: ChatPayload, request: Request):
     payload = verify_token(p.token)  # 401 gdy upłynęło 10 min
     user = payload.get("sub", "anon")
     text = p.message.strip()
+
+    # Jeśli jest klucz OpenAI – zrób prostą odpowiedź.
+    if _client:
+        try:
+            rsp = _client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are JackQS. Be concise."},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.6,
+            )
+            out = rsp.choices[0].message.content
+        except Exception as e:
+            out = f"(fallback) I got an error talking to the model, echo: {text}\n{e}"
+    else:
+        out = f"(demo) You said: {text}"
+
+    return {
+        "ok": True,
+        "user": user,
+        "answer": out,
+    }
+
+@app.post("/api/test/rate")
+def test_rate(p: RatePayload, request: Request):
+    payload = verify_token(p.token)  # 401 gdy sesja wygasła (też OK)
+    ip = request.headers.get("cf-connecting-ip") or request.client.host
+    now = int(time.time())
+
+    entry = {
+        "ts": now,
+        "user": payload.get("sub", "anon"),
+        "rating": p.rating,
+        "comment": (p.comment or "").strip(),
+        "ip": ip,
+    }
+    RATINGS.append(entry)
+    # dodatkowo log – łatwo zeskrobać z Railway Logs
+    print("RATING:", json.dumps(entry, ensure_ascii=False))
+    return {"ok": True}
+
+@app.get("/api/test/export")
+def test_export():
+    return {"ok": True, "count": len(RATINGS), "items": RATINGS}
 
     # Jeśli jest klucz OpenAI – zrób prostą odpowiedź.
     if _client:
