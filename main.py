@@ -1,184 +1,239 @@
-import os
-import json
-import time
-import typing as t
-from datetime import datetime, timedelta, timezone
+# main.py — FastAPI backend for JackQS
+# CORS open, CORE_FILE parsing (AI/RAW), language detection, chat fallback with preferred lang
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import jwt
+from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+import os, re, hashlib
 
-# ---- Prosty „tryb testu” 10 minut ----
-TEST_SECRET = os.getenv("TEST_SECRET", "dev-test-secret-change-me")
-TEST_DURATION_MIN = int(os.getenv("TEST_DURATION_MIN", "10"))
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+# Single master document that may contain both RAW and AI sections
+CORE_FILE          = os.getenv("CORE_FILE", "core/jack_master.md")
+SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "core/system_prompt.md")
+ENV_SYSTEM_PROMPT  = os.getenv("SYSTEM_PROMPT")
 
-# ---- OpenAI (opcjonalnie) ----
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-try:
-    from openai import OpenAI
-    _client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-except Exception:
-    _client = None
+# ── FILE HELPERS ────────────────────────────────────────────────────────────
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
 
-# ---- App ----
-app = FastAPI()
+def _sha1(s: str) -> str:
+    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()[:12]
 
-# PROSTE CORS NA TESTY – dowolny front (na produkcji zawęź!)
+def _status_for(path: Path, content: str) -> Dict[str, Any]:
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "len": len(content),
+        "sha1": _sha1(content) if path.exists() else None,
+    }
+
+# ── CORE_FILE PARSING → (AI, RAW) ───────────────────────────────────────────
+# You can delimit parts with HTML comments or with a header section
+AI_MARKER_RE  = re.compile(r"<!--\s*AI_PROMPT_BEGIN\s*-->(?P<ai>.*?)<!--\s*AI_PROMPT_END\s*-->", re.S | re.I)
+RAW_MARKER_RE = re.compile(r"<!--\s*RAW_BEGIN\s*-->(?P<raw>.*?)<!--\s*RAW_END\s*-->", re.S | re.I)
+
+# Header-based split (if your doc contains a clear AI/PROMPT header)
+AI_HEADER_RE   = re.compile(r"(?mis)^\s{0,3}#{1,6}\s*(AI\s*(VERSION|PROMPT)|SYSTEM\s*PROMPT|WERSJA\s*DLA\s*AI|PROMPT\s*SYSTE-?MOWY)\b.*?$")
+HEADER_LINE_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+.+$")
+
+def _extract_ai_and_raw_from_core(text: str) -> Tuple[str, str, str]:
+    """
+    Returns (ai_text, raw_text, mode)
+    mode ∈ {"markers", "headers", "all_raw"}
+    """
+    if not text.strip():
+        return "", "", "all_raw"
+
+    m_ai  = AI_MARKER_RE.search(text)
+    m_raw = RAW_MARKER_RE.search(text)
+    if m_ai or m_raw:
+        ai  = (m_ai.group("ai") if m_ai else "").strip()
+        raw = (m_raw.group("raw") if m_raw else text).strip()
+        return ai, raw, "markers"
+
+    m = AI_HEADER_RE.search(text)
+    if m:
+        start = m.start()
+        rest  = text[start:]
+        m_next = HEADER_LINE_RE.search(rest[m.end()-start:])
+        ai = (rest[:m_next.start()] if m_next else rest).strip()
+        return ai, text.strip(), "headers"
+
+    return "", text.strip(), "all_raw"
+
+def _auto_system_from_raw(raw: str, limit_chars: int = 1500) -> str:
+    """Create a compact system prompt out of the RAW part (first bullets/short lines)."""
+    if not raw:
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines()]
+    keep = []
+    acc = 0
+    for ln in lines:
+        if ln.startswith(("#", "•", "-", "–", "*")) or (0 < len(ln) <= 120):
+            keep.append(ln)
+            acc += len(ln)
+        if acc > limit_chars:
+            break
+    summary = "\n".join(keep)[:limit_chars]
+    core = (
+        "You are JackQS — a warm, steady companion. "
+        "Accompany gently (non-directive), honor non-duality, speak in user's language (PL/EN), "
+        "reply in 1–3 concise sentences, offer one doable next step."
+    )
+    return core + "\n" + summary
+
+def build_system_prompt() -> Tuple[str, Dict[str, Any]]:
+    """Resolve the active system prompt and return (text, meta)."""
+    default_sp = (
+        "You are JackQS — a warm, steady companion. "
+        "Accompany gently, honor non-duality, reply briefly (1–3 sentences), in PL/EN."
+    )
+    if ENV_SYSTEM_PROMPT and ENV_SYSTEM_PROMPT.strip():
+        return ENV_SYSTEM_PROMPT.strip(), {"source": "ENV.SYSTEM_PROMPT"}
+
+    core_path = Path(__file__).parent / CORE_FILE
+    sys_path  = Path(__file__).parent / SYSTEM_PROMPT_FILE
+    core_text = _read(core_path)
+    ai, raw, mode = _extract_ai_and_raw_from_core(core_text)
+
+    if ai:
+        return ai, {"source": f"CORE_FILE({mode})", "core_file": _status_for(core_path, core_text)}
+
+    sys_text = _read(sys_path)
+    if sys_text.strip():
+        return sys_text.strip(), {"source": "SYSTEM_PROMPT_FILE", "system_prompt_file": _status_for(sys_path, sys_text)}
+
+    if raw:
+        auto = _auto_system_from_raw(raw)
+        return auto, {"source": f"CORE_FILE(auto_from_raw:{mode})", "core_file": _status_for(core_path, core_text)}
+
+    return default_sp, {"source": "DEFAULT"}
+
+# ── FASTAPI APP + CORS ──────────────────────────────────────────────────────
+app = FastAPI(title="jack-backend")
+
+# Open CORS for tests. Later you can restrict to specific origins.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # na test OK, na prod ustaw konkretną domenę
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,   # with "*" this must stay False
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pamięć na oceny (trzymamy w RAM; GET /api/test/export zwróci zebrane)
-RATINGS: list[dict] = []
-
-# ---- Modele ----
-class ChatPayload(BaseModel):
-    # NOWE: obsługujemy oba kształty
-    message: t.Optional[str] = None            # nasz nowy, prosty format
-    messages: t.Optional[list[dict]] = None    # stary format z frontendów (array)
-    token: t.Optional[str] = None              # token z /api/test/start (gdy jest)
-    turnstile_token: t.Optional[str] = None    # ignorujemy w trybie testowym
-
-# ---- Pomocnicze JWT ----
-def issue_token(email: str | None) -> tuple[str, int]:
-    now = datetime.now(timezone.utc)
-    exp = now + timedelta(minutes=TEST_DURATION_MIN)
-    payload = {
-        "sub": email or "anon",
-        "iat": int(now.timestamp()),
-        "exp": int(exp.timestamp()),
-        "scope": "test10"
-    }
-    token = jwt.encode(payload, TEST_SECRET, algorithm="HS256")
-    return token, int(exp.timestamp())
-
-def verify_token(token: str) -> dict:
-    try:
-        payload = jwt.decode(token, TEST_SECRET, algorithms=["HS256"])
-        if payload.get("scope") != "test10":
-            raise HTTPException(status_code=403, detail="Invalid scope")
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="SessionExpired")
-    except Exception:
-        raise HTTPException(status_code=401, detail="InvalidToken")
-
-# ---- Endpoints ----
+# ── HEALTH & CORE STATUS ────────────────────────────────────────────────────
 @app.get("/api/health")
 def health():
+    _sp, meta = build_system_prompt()
+    return {"ok": True, "service": "jack-backend", "core_source": meta.get("source"), "cors": "open"}
+
+@app.get("/api/core/status")
+def core_status():
+    core_path = Path(__file__).parent / CORE_FILE
+    sys_path  = Path(__file__).parent / SYSTEM_PROMPT_FILE
+    core_text = _read(core_path)
+    ai, raw, mode = _extract_ai_and_raw_from_core(core_text)
+    sp, meta = build_system_prompt()
     return {
-        "ok": True,
-        "backend": "fastapi",
-        "model": OPENAI_MODEL,
-        "commit": os.getenv("COMMIT", "dev"),
-        # celowo nie bawimy się już „bypass/verify”; dla testu: off
-        "ts_mode": "off",
-        "warn": None,
+        "mode_detected": mode,
+        "ai_len": len(ai),
+        "raw_len": len(raw),
+        "core_file": _status_for(core_path, core_text),
+        "system_prompt_file": _status_for(sys_path, _read(sys_path)),
+        "using": {"source": meta.get("source"), "core_file": _status_for(core_path, core_text)},
     }
 
-@app.post("/api/test/start")
-def test_start(p: StartPayload):
-    token, exp = issue_token(p.email)
-    return {"token": token, "expires_at": exp, "minutes": TEST_DURATION_MIN}
+# ── INPUT EXTRACTION ────────────────────────────────────────────────────────
+def _extract_text(payload: Dict[str, Any]) -> str:
+    # Simple keys first
+    for key in ("message", "text", "input"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
 
+    # OpenAI-style messages array
+    msgs = payload.get("messages")
+    if isinstance(msgs, list) and msgs:
+        last = msgs[-1]
+        if isinstance(last, dict):
+            c = last.get("content")
+            if isinstance(c, str) and c.strip():
+                return c.strip()
+            if isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict):
+                        t = part.get("text")
+                        if isinstance(t, str) and t.strip():
+                            return t.strip()
+    return ""
+
+# ── SIMPLE LANGUAGE DETECTION (PL/EN) ───────────────────────────────────────
+PL_CHARS = set("ąćęłńóśżź")
+PL_WORDS = {"że","czy","nie","jak","co","dla","żeby","będzie","mam","muszę","dziękuję","proszę","dobrze","chcę","można","jesteś","jestem","to","tak"}
+
+def detect_lang(s: str) -> str:
+    if not s:
+        return "en"
+    s_low = s.lower()
+    if any(ch in PL_CHARS for ch in s_low):
+        return "pl"
+    tokens = re.findall(r"\b\w+\b", s_low)
+    if sum(1 for t in tokens if t in PL_WORDS) >= 2:
+        return "pl"
+    return "en"
+
+# ── FRIENDLY FALLBACK (EN/PL) ───────────────────────────────────────────────
+def friendly_fallback(user_text: str, preferred_lang: Optional[str] = None) -> str:
+    """
+    Minimal, kind reply in the desired language (used until model integration).
+    preferred_lang: "en" | "pl" | None
+    """
+    lang = preferred_lang if preferred_lang in {"en", "pl"} else detect_lang(user_text or "")
+    t = (user_text or "").strip().lower()
+
+    if lang == "pl":
+        if re.search(r"\b(hi|hello|hey|cześć|czesc|hej|heja)\b", t):
+            return "Cześć ✨ Jestem obok. Jak mogę Ci dziś towarzyszyć?"
+        if len(t) < 5:
+            return "Jestem tutaj. Opowiedz proszę trochę więcej — co teraz najbardziej potrzebne?"
+        if t.endswith("?"):
+            return "Dobre pytanie. Zajrzyjmy krok po kroku — od czego zaczniemy?"
+        return "Rozumiem. Zróbmy mały, życzliwy krok: co byłoby pomocne w tej chwili?"
+    else:
+        if re.search(r"\b(hi|hello|hey|cześć|czesc|hej|heja)\b", t):
+            return "Hi ✨ I’m here with you. How can I be with you today?"
+        if len(t) < 5:
+            return "I’m here. Tell me a little more—what feels most needed right now?"
+        if t.endswith("?"):
+            return "Good question. Let’s take it gently, step by step—where shall we begin?"
+        return "I hear you. Let’s take a kind, small step—what would help in this moment?"
+
+# ── /api/chat ───────────────────────────────────────────────────────────────
 @app.post("/api/chat")
-def chat(p: ChatPayload, request: Request):
-    payload = verify_token(p.token)  # 401 gdy upłynęło 10 min
-    user = payload.get("sub", "anon")
-    text = p.message.strip()
+async def chat(payload: Dict[str, Any] = Body(...)):
+    """
+    Request body (frontend):
+    { "message": "hello", "lang": "en" }   # lang is optional; "en"|"pl"
+    """
+    text = _extract_text(payload)
+    if not text:
+        raise HTTPException(status_code=400, detail='No message text found. Send {"message":"..."}')
 
-    # Jeśli jest klucz OpenAI – zrób prostą odpowiedź.
-    if _client:
-        try:
-            rsp = _client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are JackQS. Be concise."},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.6,
-            )
-            out = rsp.choices[0].message.content
-        except Exception as e:
-            out = f"(fallback) I got an error talking to the model, echo: {text}\n{e}"
-    else:
-        out = f"(demo) You said: {text}"
+    pref = payload.get("lang")
+    if pref not in {"pl", "en"}:
+        pref = None
 
-    return {
-        "ok": True,
-        "user": user,
-        "answer": out,
-    }
+    reply = friendly_fallback(text, preferred_lang=pref)
+    user_lang  = detect_lang(text)
+    reply_lang = pref or detect_lang(reply)
+    return {"reply": reply, "lang": reply_lang}
 
-@app.post("/api/test/rate")
-def test_rate(p: RatePayload, request: Request):
-    payload = verify_token(p.token)  # 401 gdy sesja wygasła (też OK)
-    ip = request.headers.get("cf-connecting-ip") or request.client.host
-    now = int(time.time())
+# Optional root ping
+@app.get("/")
+def root():
+    return {"ok": True, "service": "jack-backend", "entrypoint": "main:app"}
 
-    entry = {
-        "ts": now,
-        "user": payload.get("sub", "anon"),
-        "rating": p.rating,
-        "comment": (p.comment or "").strip(),
-        "ip": ip,
-    }
-    RATINGS.append(entry)
-    # dodatkowo log – łatwo zeskrobać z Railway Logs
-    print("RATING:", json.dumps(entry, ensure_ascii=False))
-    return {"ok": True}
-
-@app.get("/api/test/export")
-def test_export():
-    return {"ok": True, "count": len(RATINGS), "items": RATINGS}
-
-    # Jeśli jest klucz OpenAI – zrób prostą odpowiedź.
-    if _client:
-        try:
-            rsp = _client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are JackQS. Be concise."},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.6,
-            )
-            out = rsp.choices[0].message.content
-        except Exception as e:
-            out = f"(fallback) I got an error talking to the model, echo: {text}\n{e}"
-    else:
-        out = f"(demo) You said: {text}"
-
-    return {
-        "ok": True,
-        "user": user,
-        "answer": out,
-    }
-
-@app.post("/api/test/rate")
-def test_rate(p: RatePayload, request: Request):
-    payload = verify_token(p.token)  # 401 gdy sesja wygasła (też OK)
-    ip = request.headers.get("cf-connecting-ip") or request.client.host
-    now = int(time.time())
-
-    entry = {
-        "ts": now,
-        "user": payload.get("sub", "anon"),
-        "rating": p.rating,
-        "comment": (p.comment or "").strip(),
-        "ip": ip,
-    }
-    RATINGS.append(entry)
-    # dodatkowo log – łatwo zeskrobać z Railway Logs
-    print("RATING:", json.dumps(entry, ensure_ascii=False))
-    return {"ok": True}
-
-@app.get("/api/test/export")
-def test_export():
-    return {"ok": True, "count": len(RATINGS), "items": RATINGS}
