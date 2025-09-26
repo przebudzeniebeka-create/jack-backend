@@ -1,7 +1,7 @@
 # main.py — FastAPI backend for JackQS
 # CORS solid, CORE (R2 URL lub lokalny core/core-v1.md), EN default + PL greeting
 
-from fastapi import FastAPI, Body, HTTPException, Request
+from fastapi import FastAPI, Body, HTTPException, Request, Response, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Any, Dict, Optional, Tuple
@@ -180,30 +180,30 @@ def friendly_fallback(user_text: str, preferred_lang: Optional[str] = None) -> s
 # ── FASTAPI + CORS ────────────────────────────────────────────────────────
 app = FastAPI(title="jack-backend")
 
+# DOZWOLONE ORIGINY – dopasuj do swoich domen
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "https://chat.jackqs.ai",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,        # nie używamy '*'
+    allow_credentials=False,              # ważne przy wielu originach
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    if request.method.upper() == "OPTIONS":
-        return JSONResponse(
-            content={"ok": True},
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-            }
-        )
-    resp = await call_next(request)
-    resp.headers["Access-Control-Allow-Origin"]  = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    return resp
+# Preflight OPTIONS dla całego /api/*
+api_cors_router = APIRouter()
+
+@api_cors_router.options("/{rest_of_path:path}")
+def options_cors(rest_of_path: str):
+    # CORSMiddleware doda nagłówki; 204 bez ciała
+    return Response(status_code=204)
+
+app.include_router(api_cors_router, prefix="/api")
 
 # ── ROUTES ────────────────────────────────────────────────────────────────
 @app.get("/api/health")
@@ -263,6 +263,7 @@ async def chat(payload: Dict[str, Any] = Body(...)):
 @app.get("/")
 def root():
     return {"ok": True, "service": "jack-backend", "entrypoint": "main:app"}
+
 
 
 
