@@ -1,29 +1,22 @@
 # main.py — FastAPI backend for JackQS
 # CORS solid, CORE (R2 URL lub lokalny core/core-v1.md), EN default + PL greeting
 
-from fastapi import FastAPI, Body, HTTPException, Request, Response, APIRouter
+from fastapi import FastAPI, Body, HTTPException, Response, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from typing import Any, Dict, Optional, Tuple
 from pathlib import Path
-import os, re, hashlib
-
-# NEW: do weryfikacji Turnstile
 from pydantic import BaseModel
+import os, re, hashlib
 import httpx
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
-# Nazwa obiektu/plik rdzenia (możesz nadpisać CORE_OBJECT_KEY=core-v1.md)
 CORE_OBJECT_KEY    = os.getenv("CORE_OBJECT_KEY", "core-v1.md").strip()
-# Lokalny plik (w repo) — dostosowany do Twojego układu folderów:
 CORE_FILE          = os.getenv("CORE_FILE", f"core/{CORE_OBJECT_KEY}")
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "core/system_prompt.md")
 ENV_SYSTEM_PROMPT  = os.getenv("SYSTEM_PROMPT", "").strip()
-
-# Publiczny lub sygnowany URL do pliku w R2 (jeśli podasz, to będzie użyty jako 1. źródło)
 CORE_R2_URL        = os.getenv("CORE_R2_URL", "").strip()
 
-# NEW: sekret Turnstile (Railway → Variables)
+# Sekret Turnstile (Railway → Variables)
 TURNSTILE_SECRET   = os.getenv("TURNSTILE_SECRET", "").strip()
 
 # ── UTILS ─────────────────────────────────────────────────────────────────
@@ -187,7 +180,6 @@ def friendly_fallback(user_text: str, preferred_lang: Optional[str] = None) -> s
 # ── FASTAPI + CORS ────────────────────────────────────────────────────────
 app = FastAPI(title="jack-backend")
 
-# DOZWOLONE ORIGINY – dopasuj do swoich domen
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "https://chat.jackqs.ai",
@@ -195,8 +187,8 @@ ALLOWED_ORIGINS = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,        # nie używamy '*'
-    allow_credentials=False,              # ważne przy wielu originach
+    allow_origins=ALLOWED_ORIGINS,   # nie używamy '*'
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -207,7 +199,6 @@ api_cors_router = APIRouter()
 
 @api_cors_router.options("/{rest_of_path:path}")
 def options_cors(rest_of_path: str):
-    # CORSMiddleware doda nagłówki; 204 bez ciała
     return Response(status_code=204)
 
 app.include_router(api_cors_router, prefix="/api")
@@ -259,15 +250,16 @@ def _extract_text(payload: Dict[str, Any]) -> str:
 class TurnstileVerifyIn(BaseModel):
     token: str
 
-# NEW: weryfikacja tokena Turnstile na backendzie (twarda)
+# NEW: twarda weryfikacja tokena Turnstile
 @app.post("/api/turnstile/verify")
 async def turnstile_verify(body: TurnstileVerifyIn):
     if not TURNSTILE_SECRET:
-        # brak sekretu = błąd konfiguracji serwera
+        # jawny błąd konfiguracji serwera – bez sekretu nie weryfikujemy
         raise HTTPException(status_code=500, detail="TURNSTILE_SECRET not set")
+
     token = (body.token or "").strip()
     if len(token) < 10:
-        return {"success": False, "errors": ["token_missing_or_short"]}
+        return {"ok": False, "success": False, "errors": ["token_missing_or_short"]}
 
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -277,8 +269,8 @@ async def turnstile_verify(body: TurnstileVerifyIn):
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         j = resp.json()
-        # Zwróć prostą odpowiedź (front patrzy tylko na 'success')
-        return {"success": bool(j.get("success")), "errors": j.get("error-codes", [])}
+        ok = bool(j.get("success"))
+        return {"ok": ok, "success": ok, "errors": j.get("error-codes", [])}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"turnstile_verify_error:{e}")
 
@@ -297,6 +289,7 @@ async def chat(payload: Dict[str, Any] = Body(...)):
 @app.get("/")
 def root():
     return {"ok": True, "service": "jack-backend", "entrypoint": "main:app"}
+
 
 
 
