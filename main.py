@@ -8,6 +8,10 @@ from typing import Any, Dict, Optional, Tuple
 from pathlib import Path
 import os, re, hashlib
 
+# NEW: do weryfikacji Turnstile
+from pydantic import BaseModel
+import httpx
+
 # ── CONFIG ────────────────────────────────────────────────────────────────
 # Nazwa obiektu/plik rdzenia (możesz nadpisać CORE_OBJECT_KEY=core-v1.md)
 CORE_OBJECT_KEY    = os.getenv("CORE_OBJECT_KEY", "core-v1.md").strip()
@@ -18,6 +22,9 @@ ENV_SYSTEM_PROMPT  = os.getenv("SYSTEM_PROMPT", "").strip()
 
 # Publiczny lub sygnowany URL do pliku w R2 (jeśli podasz, to będzie użyty jako 1. źródło)
 CORE_R2_URL        = os.getenv("CORE_R2_URL", "").strip()
+
+# NEW: sekret Turnstile (Railway → Variables)
+TURNSTILE_SECRET   = os.getenv("TURNSTILE_SECRET", "").strip()
 
 # ── UTILS ─────────────────────────────────────────────────────────────────
 def _read(path: Path) -> str:
@@ -247,6 +254,33 @@ def _extract_text(payload: Dict[str, Any]) -> str:
                         if isinstance(t, str) and t.strip():
                             return t.strip()
     return ""
+
+# NEW: model wejścia do weryfikacji
+class TurnstileVerifyIn(BaseModel):
+    token: str
+
+# NEW: weryfikacja tokena Turnstile na backendzie (twarda)
+@app.post("/api/turnstile/verify")
+async def turnstile_verify(body: TurnstileVerifyIn):
+    if not TURNSTILE_SECRET:
+        # brak sekretu = błąd konfiguracji serwera
+        raise HTTPException(status_code=500, detail="TURNSTILE_SECRET not set")
+    token = (body.token or "").strip()
+    if len(token) < 10:
+        return {"success": False, "errors": ["token_missing_or_short"]}
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                data={"secret": TURNSTILE_SECRET, "response": token},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        j = resp.json()
+        # Zwróć prostą odpowiedź (front patrzy tylko na 'success')
+        return {"success": bool(j.get("success")), "errors": j.get("error-codes", [])}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"turnstile_verify_error:{e}")
 
 @app.post("/api/chat")
 async def chat(payload: Dict[str, Any] = Body(...)):
