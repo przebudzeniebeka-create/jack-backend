@@ -1,17 +1,9 @@
-# --- Core API ---
 fastapi==0.115.2
 uvicorn[standard]==0.30.6
-
-# --- HTTP clients (Turnstile verify + pobieranie R2/URL) ---
 httpx==0.27.2
 requests==2.32.3
-
-# --- Modele/konfiguracja ---
 pydantic==2.9.2
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
-
-# --- (opcjonalnie) jeśli w /api/chat będziemy wołać OpenAI ---
 openai==1.40.0
-
 
