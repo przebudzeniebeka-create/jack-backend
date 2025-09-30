@@ -1,4 +1,5 @@
-web: uvicorn main:app --host 0.0.0.0 --port $PORT --log-level info
+web: gunicorn -k uvicorn.workers.UvicornWorker -w 1 main:app
+
 
 
 
