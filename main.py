@@ -1,5 +1,6 @@
 # main.py — FastAPI backend for JackQS
 # CORS solid, CORE (R2 URL lub lokalny core/core-v1.md), EN default + PL greeting
+# + twarda weryfikacja Cloudflare Turnstile
 
 from fastapi import FastAPI, Body, HTTPException, Response, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,14 +11,21 @@ import os, re, hashlib
 import httpx
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
+# Nazwa obiektu/plik rdzenia (możesz nadpisać CORE_OBJECT_KEY=core-v1.md)
 CORE_OBJECT_KEY    = os.getenv("CORE_OBJECT_KEY", "core-v1.md").strip()
+# Lokalny plik (w repo) — dostosowany do Twojego układu folderów:
 CORE_FILE          = os.getenv("CORE_FILE", f"core/{CORE_OBJECT_KEY}")
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "core/system_prompt.md")
 ENV_SYSTEM_PROMPT  = os.getenv("SYSTEM_PROMPT", "").strip()
+
+# Publiczny lub sygnowany URL do pliku w R2 (jeśli podasz, to będzie użyty jako 1. źródło)
 CORE_R2_URL        = os.getenv("CORE_R2_URL", "").strip()
 
-# Sekret Turnstile (Railway → Variables)
-TURNSTILE_SECRET   = os.getenv("TURNSTILE_SECRET", "").strip()
+# Sekret Turnstile: czytamy DWIE nazwy, aby nie zabiła nas literówka w env
+TURNSTILE_SECRET   = (
+    os.getenv("TURNSTILE_SECRET", "").strip()
+    or os.getenv("TURNSTILE_SECRET_KEY", "").strip()
+)
 
 # ── UTILS ─────────────────────────────────────────────────────────────────
 def _read(path: Path) -> str:
@@ -180,6 +188,7 @@ def friendly_fallback(user_text: str, preferred_lang: Optional[str] = None) -> s
 # ── FASTAPI + CORS ────────────────────────────────────────────────────────
 app = FastAPI(title="jack-backend")
 
+# DOZWOLONE ORIGINY – dopasuj do swoich domen
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "https://chat.jackqs.ai",
@@ -187,8 +196,8 @@ ALLOWED_ORIGINS = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,   # nie używamy '*'
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,        # nie używamy '*'
+    allow_credentials=False,              # ważne przy wielu originach
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -199,6 +208,7 @@ api_cors_router = APIRouter()
 
 @api_cors_router.options("/{rest_of_path:path}")
 def options_cors(rest_of_path: str):
+    # CORSMiddleware doda nagłówki; 204 bez ciała
     return Response(status_code=204)
 
 app.include_router(api_cors_router, prefix="/api")
@@ -246,20 +256,19 @@ def _extract_text(payload: Dict[str, Any]) -> str:
                             return t.strip()
     return ""
 
-# NEW: model wejścia do weryfikacji
+# NEW: model wejścia do weryfikacji Turnstile
 class TurnstileVerifyIn(BaseModel):
     token: str
 
-# NEW: twarda weryfikacja tokena Turnstile
+# NEW: weryfikacja tokena Turnstile na backendzie (twarda)
 @app.post("/api/turnstile/verify")
 async def turnstile_verify(body: TurnstileVerifyIn):
     if not TURNSTILE_SECRET:
-        # jawny błąd konfiguracji serwera – bez sekretu nie weryfikujemy
+        # brak sekretu = błąd konfiguracji serwera
         raise HTTPException(status_code=500, detail="TURNSTILE_SECRET not set")
-
     token = (body.token or "").strip()
     if len(token) < 10:
-        return {"ok": False, "success": False, "errors": ["token_missing_or_short"]}
+        return {"success": False, "errors": ["token_missing_or_short"]}
 
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -268,9 +277,15 @@ async def turnstile_verify(body: TurnstileVerifyIn):
                 data={"secret": TURNSTILE_SECRET, "response": token},
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
-        j = resp.json()
-        ok = bool(j.get("success"))
-        return {"ok": ok, "success": ok, "errors": j.get("error-codes", [])}
+        # na wypadek nietypowych odpowiedzi
+        try:
+            j = resp.json()
+        except Exception:
+            raise HTTPException(status_code=502, detail="turnstile_bad_json")
+
+        return {"success": bool(j.get("success")), "errors": j.get("error-codes", [])}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"turnstile_verify_error:{e}")
 
@@ -289,6 +304,7 @@ async def chat(payload: Dict[str, Any] = Body(...)):
 @app.get("/")
 def root():
     return {"ok": True, "service": "jack-backend", "entrypoint": "main:app"}
+
 
 
 
