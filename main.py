@@ -1,28 +1,32 @@
 # main.py — FastAPI backend for JackQS
-# - CORS
-# - CORE (R2 URL lub lokalny core/core-v1.md)
-# - Default greeting EN, auto-switch to PL on Polish input
-# - Turnstile verify endpoint
-# - /api/chat -> OpenAI z system_prompt z CORE
+# CORS solid, CORE (R2 URL lub lokalny core/core-v1.md), EN default + PL greeting
+# Turnstile: poprawione aliasy (/api/turnstile/verify i /turnstile/verify) + preflight OPTIONS
 
 from fastapi import FastAPI, Body, HTTPException, Response, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import Any, Dict, Optional, Tuple
 from pathlib import Path
-import os, re, hashlib, requests
+import os, re, hashlib
 
-# ---------- CONFIG ----------
+# NEW: do weryfikacji Turnstile
+from pydantic import BaseModel
+import httpx
+
+# ── CONFIG ────────────────────────────────────────────────────────────────
+# Nazwa obiektu/plik rdzenia (możesz nadpisać CORE_OBJECT_KEY=core-v1.md)
 CORE_OBJECT_KEY    = os.getenv("CORE_OBJECT_KEY", "core-v1.md").strip()
+# Lokalny plik (w repo) — dostosowany do Twojego układu folderów:
 CORE_FILE          = os.getenv("CORE_FILE", f"core/{CORE_OBJECT_KEY}")
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "core/system_prompt.md")
 ENV_SYSTEM_PROMPT  = os.getenv("SYSTEM_PROMPT", "").strip()
-CORE_R2_URL        = os.getenv("CORE_R2_URL", "").strip()
-TURNSTILE_SECRET   = os.getenv("TURNSTILE_SECRET", "").strip()
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# ---------- UTILS ----------
+# Publiczny lub sygnowany URL do pliku w R2 (jeśli podasz, to będzie użyty jako 1. źródło)
+CORE_R2_URL        = os.getenv("CORE_R2_URL", "").strip()
+
+# NEW: sekret Turnstile (Railway → Variables)
+TURNSTILE_SECRET   = os.getenv("TURNSTILE_SECRET", "").strip()
+
+# ── UTILS ─────────────────────────────────────────────────────────────────
 def _read(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -33,6 +37,7 @@ def _http_get_text(url: str, timeout: int = 8) -> str:
     if not url:
         return ""
     try:
+        import requests
         r = requests.get(url, timeout=timeout)
         if r.ok and isinstance(r.text, str):
             return r.text
@@ -43,15 +48,24 @@ def _http_get_text(url: str, timeout: int = 8) -> str:
 def _sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()[:12]
 
-# ---------- CORE PARSING ----------
-import re as _re
+def _status_for(path: Path, content: str) -> Dict[str, Any]:
+    p = Path(path)
+    return {
+        "path": str(p.resolve()) if p.exists() else str(p),
+        "exists": p.exists(),
+        "len": len(content or ""),
+        "sha1": _sha1(content or "") if p.exists() else None,
+    }
 
-AI_MARKER_RE  = _re.compile(r"<!--\s*AI_PROMPT_BEGIN\s*-->(?P<ai>.*?)<!--\s*AI_PROMPT_END\s*-->", _re.S | _re.I)
-RAW_MARKER_RE = _re.compile(r"<!--\s*RAW_BEGIN\s*-->(?P<raw>.*?)<!--\s*RAW_END\s*-->", _re.S | _re.I)
-AI_HEADER_RE   = _re.compile(r"(?mis)^\s{0,3}#{1,6}\s*(AI\s*(VERSION|PROMPT)|SYSTEM\s*PROMPT|WERSJA\s*DLA\s*AI|PROMPT\s*SYSTE-?MOWY)\b.*?$")
-HEADER_LINE_RE = _re.compile(r"(?m)^\s{0,3}#{1,6}\s+.+$")
+# ── CORE PARSING (AI / RAW) ──────────────────────────────────────────────
+AI_MARKER_RE  = re.compile(r"<!--\s*AI_PROMPT_BEGIN\s*-->(?P<ai>.*?)<!--\s*AI_PROMPT_END\s*-->", re.S | re.I)
+RAW_MARKER_RE = re.compile(r"<!--\s*RAW_BEGIN\s*-->(?P<raw>.*?)<!--\s*RAW_END\s*-->", re.S | re.I)
+
+AI_HEADER_RE   = re.compile(r"(?mis)^\s{0,3}#{1,6}\s*(AI\s*(VERSION|PROMPT)|SYSTEM\s*PROMPT|WERSJA\s*DLA\s*AI|PROMPT\s*SYSTE-?MOWY)\b.*?$")
+HEADER_LINE_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+.+$")
 
 def _extract_ai_and_raw_from_core(text: str) -> Tuple[str, str, str]:
+    """Return (ai_text, raw_text, mode) where mode ∈ {'markers','headers','all_raw'}."""
     if not (text or "").strip():
         return "", "", "all_raw"
     m_ai  = AI_MARKER_RE.search(text)
@@ -83,17 +97,25 @@ def _auto_system_from_raw(raw: str, limit_chars: int = 1500) -> str:
     summary = "\n".join(keep)[:limit_chars]
     core = (
         "You are JackQS — a warm, steady companion. "
-        "Default to EN on first contact, then answer in the user's language (PL/EN). "
         "Honor non-duality; broaden perspective; be kind and succinct (1–3 sentences). "
-        "Continuously use the CORE knowledge to build understanding and context."
+        "Always speak in the user's language (PL/EN). "
+        "Continuously draw from the CORE knowledge to build understanding."
     )
     return core + "\n" + summary
 
 def build_system_prompt() -> Tuple[str, Dict[str, Any]]:
+    """
+    Precedence:
+      1) ENV SYSTEM_PROMPT
+      2) CORE_R2_URL (R2 public/signed)
+      3) Local CORE_FILE (core/<CORE_OBJECT_KEY>)
+      4) SYSTEM_PROMPT_FILE
+      5) Auto from RAW
+      6) Default
+    """
     default_sp = (
         "You are JackQS — a warm, steady companion. "
-        "Default to EN for greeting. After detecting Polish, answer in PL. "
-        "Be kind, succinct (1–3 sentences). Use CORE if available."
+        "Honor non-duality; broaden perspective; reply briefly (1–3 sentences), in PL/EN."
     )
 
     if ENV_SYSTEM_PROMPT:
@@ -114,19 +136,19 @@ def build_system_prompt() -> Tuple[str, Dict[str, Any]]:
     core_text = _read(core_path)
     ai, raw, mode = _extract_ai_and_raw_from_core(core_text)
     if ai:
-        return ai, {"source": f"CORE_FILE({mode})"}
+        return ai, {"source": f"CORE_FILE({mode})", "core_file": _status_for(core_path, core_text)}
 
     sys_text = _read(sys_path)
     if sys_text.strip():
-        return sys_text.strip(), {"source": "SYSTEM_PROMPT_FILE"}
+        return sys_text.strip(), {"source": "SYSTEM_PROMPT_FILE", "system_prompt_file": _status_for(sys_path, sys_text)}
 
     if raw:
         auto = _auto_system_from_raw(raw)
-        return auto, {"source": f"CORE_FILE(auto_from_raw:{mode})"}
+        return auto, {"source": f"CORE_FILE(auto_from_raw:{mode})", "core_file": _status_for(core_path, core_text)}
 
     return default_sp, {"source": "DEFAULT"}
 
-# ---------- LANG ----------
+# ── LANG DETECTION ────────────────────────────────────────────────────────
 PL_CHARS = set("ąćęłńóśżź")
 PL_WORDS = {"że","czy","nie","jak","co","dla","żeby","będzie","mam","muszę","dziękuję","proszę","dobrze","chcę","można","jesteś","jestem","to","tak","cześć","hej"}
 
@@ -141,43 +163,91 @@ def detect_lang(s: str) -> str:
         return "pl"
     return "en"
 
-# ---------- APP + CORS ----------
+# ── FRIENDLY FALLBACK ─────────────────────────────────────────────────────
+def friendly_fallback(user_text: str, preferred_lang: Optional[str] = None) -> str:
+    lang = preferred_lang if preferred_lang in {"en", "pl"} else detect_lang(user_text or "")
+    t = (user_text or "").strip().lower()
+
+    if lang == "pl":
+        if re.search(r"\b(hi|hello|hey|cześć|czesc|hej|heja)\b", t) or len(t) < 3:
+            return "Cześć, nazywam się Jack. Jestem otwarty na to, by Ciebie wysłuchać. Od czego chcesz zacząć naszą rozmowę?"
+        if re.search(r"\b(pomoc|pomóc|help)\b", t):
+            return "Cześć, nazywam się Jack, czy mogę Ci w czymś pomóc?"
+        if t.endswith("?"):
+            return "Dobre pytanie. Zajrzyjmy spokojnie — od czego chcesz zacząć?"
+        return "Jestem tu dla Ciebie. Zróbmy mały, życzliwy krok — co teraz najbardziej potrzebne?"
+
+    # EN default
+    if re.search(r"\b(hi|hello|hey)\b", t) or len(t) < 3:
+        return "Hi, I’m Jack. I’m here to listen. Where would you like to start?"
+    if t.endswith("?"):
+        return "Good question — let’s take it gently, step by step. Where shall we begin?"
+    return "I’m with you. Let’s take a kind, small step — what would help right now?"
+
+# ── FASTAPI + CORS ────────────────────────────────────────────────────────
 app = FastAPI(title="jack-backend")
 
+# DOZWOLONE ORIGINY – dopasuj do swoich domen
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "https://chat.jackqs.ai",
+    "https://web-production-fe0b0.up.railway.app",  # Twój front na Railway (dopasuj, jeśli inny)
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,        # nie używamy '*'
+    allow_credentials=False,              # ważne przy wielu originach
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
-# OPTIONS for /api/*
+# Preflight OPTIONS dla całego /api/*
 api_cors_router = APIRouter()
+
 @api_cors_router.options("/{rest_of_path:path}")
 def options_cors(rest_of_path: str):
+    # CORSMiddleware doda nagłówki; 204 bez ciała
     return Response(status_code=204)
+
 app.include_router(api_cors_router, prefix="/api")
 
-# ---------- Turnstile ----------
+# ── ROUTES: HEALTH / CORE STATUS ──────────────────────────────────────────
+@app.get("/api/health")
+def health():
+    sp, meta = build_system_prompt()
+    return {"ok": True, "service": "jack-backend", "core_source": meta.get("source")}
+
+@app.get("/api/core/status")
+def core_status():
+    core_path = Path(__file__).parent / CORE_FILE
+    sys_path  = Path(__file__).parent / SYSTEM_PROMPT_FILE
+    core_text = _read(core_path)
+    ai, raw, mode = _extract_ai_and_raw_from_core(core_text)
+    sp, meta = build_system_prompt()
+    return {
+        "mode_detected": mode,
+        "ai_len": len(ai),
+        "raw_len": len(raw),
+        "core_file": _status_for(core_path, core_text),
+        "system_prompt_file": _status_for(sys_path, _read(sys_path)),
+        "active_source": meta.get("source"),
+        "core_object_key": CORE_OBJECT_KEY,
+    }
+
+# ── TURNSTILE (NAPRAWIONE) ───────────────────────────────────────────────
 class TurnstileVerifyIn(BaseModel):
     token: str
 
-import httpx
-
-@app.post("/api/turnstile/verify")
-async def turnstile_verify(body: TurnstileVerifyIn):
+async def _verify_turnstile_core(payload: TurnstileVerifyIn):
     if not TURNSTILE_SECRET:
+        # brak sekretu = błąd konfiguracji serwera
         raise HTTPException(status_code=500, detail="TURNSTILE_SECRET not set")
-    token = (body.token or "").strip()
+    token = (payload.token or "").strip()
     if len(token) < 10:
         return {"success": False, "errors": ["token_missing_or_short"]}
+
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(
@@ -186,11 +256,30 @@ async def turnstile_verify(body: TurnstileVerifyIn):
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         j = resp.json()
+        # Zwróć prostą odpowiedź (front patrzy tylko na 'success')
         return {"success": bool(j.get("success")), "errors": j.get("error-codes", [])}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"turnstile_verify_error:{e}")
 
-# ---------- Chat (OpenAI + CORE) ----------
+# Aliasy: /api/turnstile/verify i /turnstile/verify (oba działają)
+@app.post("/api/turnstile/verify")
+async def turnstile_verify_api(body: TurnstileVerifyIn = Body(...)):
+    return await _verify_turnstile_core(body)
+
+@app.post("/turnstile/verify")
+async def turnstile_verify_root(body: TurnstileVerifyIn = Body(...)):
+    return await _verify_turnstile_core(body)
+
+# Preflight OPTIONS dla obu ścieżek
+@app.options("/api/turnstile/verify")
+def turnstile_verify_api_options():
+    return Response(status_code=204)
+
+@app.options("/turnstile/verify")
+def turnstile_verify_root_options():
+    return Response(status_code=204)
+
+# ── CHAT (fallback demo; możesz zastąpić swoim LLM) ───────────────────────
 def _extract_text(payload: Dict[str, Any]) -> str:
     for key in ("message", "text", "input"):
         v = payload.get(key)
@@ -211,60 +300,23 @@ def _extract_text(payload: Dict[str, Any]) -> str:
                             return t.strip()
     return ""
 
-from openai import OpenAI
-_client: Optional[OpenAI] = None
-
-def openai_client() -> OpenAI:
-    global _client
-    if _client is None:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY not set")
-        _client = OpenAI(api_key=OPENAI_API_KEY)
-    return _client
-
 @app.post("/api/chat")
-def chat(payload: Dict[str, Any] = Body(...)):
-    user_text = _extract_text(payload)
-    if not user_text:
+async def chat(payload: Dict[str, Any] = Body(...)):
+    text = _extract_text(payload)
+    if not text:
         raise HTTPException(status_code=400, detail='No message text found. Send {"message":"..."}')
+    pref = payload.get("lang")
+    if pref not in {"pl", "en"}:
+        pref = None
+    reply = friendly_fallback(text, preferred_lang=pref)
+    reply_lang = pref or detect_lang(reply)
+    return {"reply": reply, "lang": reply_lang}
 
-    # system prompt from CORE
-    system_prompt, meta = build_system_prompt()
-
-    # language: prefer EN on first contact; switch to PL only if we detect Polish in user_text
-    prefer = payload.get("lang")
-    detected = detect_lang(user_text)
-    reply_lang = "pl" if detected == "pl" else (prefer if prefer in {"pl","en"} else "en")
-
-    try:
-        client = openai_client()
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ]
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=msgs,
-            temperature=0.6,
-            max_tokens=300,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        # twardy fallback jeśli API padnie
-        if reply_lang == "pl":
-            text = "Cześć, jestem Jack. Jestem tu, by Cię życzliwie wesprzeć. Od czego zaczynamy?"
-        else:
-            text = "Hi, I’m Jack. I’m here to listen and help. Where would you like to start?"
-
-    return {
-        "reply": text,
-        "lang": reply_lang,
-        "core_source": meta.get("source"),
-    }
-
+# ── ROOT ──────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"ok": True, "service": "jack-backend", "entrypoint": "main:app"}
+
 
 
 
