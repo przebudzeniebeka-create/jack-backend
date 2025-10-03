@@ -241,12 +241,13 @@ class TurnstileVerifyIn(BaseModel):
     token: str
 
 async def _verify_turnstile_core(payload: TurnstileVerifyIn):
-    if not TURNSTILE_SECRET:
-        # brak sekretu = błąd konfiguracji serwera
-        raise HTTPException(status_code=500, detail="TURNSTILE_SECRET not set")
     token = (payload.token or "").strip()
     if len(token) < 10:
         return {"success": False, "errors": ["token_missing_or_short"]}
+
+    # ⬇️ ZMIANA: jeśli brak secretu, nie rób 500 – zwróć czytelną odpowiedź
+    if not TURNSTILE_SECRET:
+        return {"success": False, "errors": ["server_secret_missing"]}
 
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -256,66 +257,11 @@ async def _verify_turnstile_core(payload: TurnstileVerifyIn):
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         j = resp.json()
-        # Zwróć prostą odpowiedź (front patrzy tylko na 'success')
         return {"success": bool(j.get("success")), "errors": j.get("error-codes", [])}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"turnstile_verify_error:{e}")
+        # 502 miewało puste body – też zamieniamy na czytelne 200
+        return {"success": False, "errors": [f"turnstile_verify_error:{e}"]}
 
-# Aliasy: /api/turnstile/verify i /turnstile/verify (oba działają)
-@app.post("/api/turnstile/verify")
-async def turnstile_verify_api(body: TurnstileVerifyIn = Body(...)):
-    return await _verify_turnstile_core(body)
-
-@app.post("/turnstile/verify")
-async def turnstile_verify_root(body: TurnstileVerifyIn = Body(...)):
-    return await _verify_turnstile_core(body)
-
-# Preflight OPTIONS dla obu ścieżek
-@app.options("/api/turnstile/verify")
-def turnstile_verify_api_options():
-    return Response(status_code=204)
-
-@app.options("/turnstile/verify")
-def turnstile_verify_root_options():
-    return Response(status_code=204)
-
-# ── CHAT (fallback demo; możesz zastąpić swoim LLM) ───────────────────────
-def _extract_text(payload: Dict[str, Any]) -> str:
-    for key in ("message", "text", "input"):
-        v = payload.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    msgs = payload.get("messages")
-    if isinstance(msgs, list) and msgs:
-        last = msgs[-1]
-        if isinstance(last, dict):
-            c = last.get("content")
-            if isinstance(c, str) and c.strip():
-                return c.strip()
-            if isinstance(c, list):
-                for part in c:
-                    if isinstance(part, dict):
-                        t = part.get("text")
-                        if isinstance(t, str) and t.strip():
-                            return t.strip()
-    return ""
-
-@app.post("/api/chat")
-async def chat(payload: Dict[str, Any] = Body(...)):
-    text = _extract_text(payload)
-    if not text:
-        raise HTTPException(status_code=400, detail='No message text found. Send {"message":"..."}')
-    pref = payload.get("lang")
-    if pref not in {"pl", "en"}:
-        pref = None
-    reply = friendly_fallback(text, preferred_lang=pref)
-    reply_lang = pref or detect_lang(reply)
-    return {"reply": reply, "lang": reply_lang}
-
-# ── ROOT ──────────────────────────────────────────────────────────────────
-@app.get("/")
-def root():
-    return {"ok": True, "service": "jack-backend", "entrypoint": "main:app"}
 
 
 
