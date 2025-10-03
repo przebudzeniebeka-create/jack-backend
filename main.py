@@ -8,7 +8,6 @@ from typing import Any, Dict, Optional, Tuple
 from pathlib import Path
 import os, re, hashlib
 
-# NEW: do weryfikacji Turnstile
 from pydantic import BaseModel
 import httpx
 
@@ -19,24 +18,20 @@ SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "core/system_prompt.md")
 ENV_SYSTEM_PROMPT  = os.getenv("SYSTEM_PROMPT", "").strip()
 CORE_R2_URL        = os.getenv("CORE_R2_URL", "").strip()
 
-# Sekret Turnstile (Railway → Variables)
+# Turnstile secret (Railway → Variables)
 TURNSTILE_SECRET   = os.getenv("TURNSTILE_SECRET", "").strip()
 
 # ── UTILS ─────────────────────────────────────────────────────────────────
 def _read(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return ""
+    try: return path.read_text(encoding="utf-8")
+    except Exception: return ""
 
 def _http_get_text(url: str, timeout: int = 8) -> str:
-    if not url:
-        return ""
+    if not url: return ""
     try:
         import requests
         r = requests.get(url, timeout=timeout)
-        if r.ok and isinstance(r.text, str):
-            return r.text
+        if r.ok and isinstance(r.text, str): return r.text
     except Exception:
         pass
     return ""
@@ -61,9 +56,7 @@ AI_HEADER_RE   = re.compile(r"(?mis)^\s{0,3}#{1,6}\s*(AI\s*(VERSION|PROMPT)|SYST
 HEADER_LINE_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+.+$")
 
 def _extract_ai_and_raw_from_core(text: str) -> Tuple[str, str, str]:
-    """Return (ai_text, raw_text, mode) where mode ∈ {'markers','headers','all_raw'}."""
-    if not (text or "").strip():
-        return "", "", "all_raw"
+    if not (text or "").strip(): return "", "", "all_raw"
     m_ai  = AI_MARKER_RE.search(text)
     m_raw = RAW_MARKER_RE.search(text)
     if m_ai or m_raw:
@@ -80,16 +73,13 @@ def _extract_ai_and_raw_from_core(text: str) -> Tuple[str, str, str]:
     return "", text.strip(), "all_raw"
 
 def _auto_system_from_raw(raw: str, limit_chars: int = 1500) -> str:
-    if not raw:
-        return ""
+    if not raw: return ""
     lines = [ln.strip() for ln in raw.splitlines()]
     keep, acc = [], 0
     for ln in lines:
         if ln.startswith(("#", "•", "-", "–", "*")) or (0 < len(ln) <= 120):
-            keep.append(ln)
-            acc += len(ln)
-        if acc > limit_chars:
-            break
+            keep.append(ln); acc += len(ln)
+        if acc > limit_chars: break
     summary = "\n".join(keep)[:limit_chars]
     core = (
         "You are JackQS — a warm, steady companion. "
@@ -100,15 +90,6 @@ def _auto_system_from_raw(raw: str, limit_chars: int = 1500) -> str:
     return core + "\n" + summary
 
 def build_system_prompt() -> Tuple[str, Dict[str, Any]]:
-    """
-    Precedence:
-      1) ENV SYSTEM_PROMPT
-      2) CORE_R2_URL (R2 public/signed)
-      3) Local CORE_FILE (core/<CORE_OBJECT_KEY>)
-      4) SYSTEM_PROMPT_FILE
-      5) Auto from RAW
-      6) Default
-    """
     default_sp = (
         "You are JackQS — a warm, steady companion. "
         "Honor non-duality; broaden perspective; reply briefly (1–3 sentences), in PL/EN."
@@ -149,14 +130,11 @@ PL_CHARS = set("ąćęłńóśżź")
 PL_WORDS = {"że","czy","nie","jak","co","dla","żeby","będzie","mam","muszę","dziękuję","proszę","dobrze","chcę","można","jesteś","jestem","to","tak","cześć","hej"}
 
 def detect_lang(s: str) -> str:
-    if not s:
-        return "en"
+    if not s: return "en"
     s_low = s.lower()
-    if any(ch in PL_CHARS for ch in s_low):
-        return "pl"
+    if any(ch in PL_CHARS for ch in s_low): return "pl"
     tokens = re.findall(r"\b\w+\b", s_low)
-    if sum(1 for t in tokens if t in PL_WORDS) >= 2:
-        return "pl"
+    if sum(1 for t in tokens if t in PL_WORDS) >= 2: return "pl"
     return "en"
 
 # ── FRIENDLY FALLBACK ─────────────────────────────────────────────────────
@@ -173,7 +151,6 @@ def friendly_fallback(user_text: str, preferred_lang: Optional[str] = None) -> s
             return "Dobre pytanie. Zajrzyjmy spokojnie — od czego chcesz zacząć?"
         return "Jestem tu dla Ciebie. Zróbmy mały, życzliwy krok — co teraz najbardziej potrzebne?"
 
-    # EN default
     if re.search(r"\b(hi|hello|hey)\b", t) or len(t) < 3:
         return "Hi, I’m Jack. I’m here to listen. Where would you like to start?"
     if t.endswith("?"):
@@ -198,7 +175,6 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# Preflight OPTIONS dla całego /api/*
 api_cors_router = APIRouter()
 
 @api_cors_router.options("/{rest_of_path:path}")
@@ -230,7 +206,6 @@ def core_status():
         "core_object_key": CORE_OBJECT_KEY,
     }
 
-# szybki podgląd zarejestrowanych tras (diagnoza deployu)
 @app.get("/api/routes")
 def routes():
     return {"routes": [r.path for r in app.router.routes]}
@@ -244,7 +219,6 @@ async def _verify_turnstile_core(payload: TurnstileVerifyIn):
     if len(token) < 10:
         return {"success": False, "errors": ["token_missing_or_short"]}
 
-    # Zamiast 500 — czytelna odpowiedź, żeby UI nie walił alertem bez sensu
     if not TURNSTILE_SECRET:
         return {"success": False, "errors": ["server_secret_missing"]}
 
@@ -260,7 +234,6 @@ async def _verify_turnstile_core(payload: TurnstileVerifyIn):
     except Exception as e:
         return {"success": False, "errors": [f"turnstile_verify_error:{e}"]}
 
-# Aliasy: /api/turnstile/verify i /turnstile/verify (oba działają)
 @app.post("/api/turnstile/verify")
 async def turnstile_verify_api(body: TurnstileVerifyIn = Body(...)):
     return await _verify_turnstile_core(body)
@@ -269,7 +242,6 @@ async def turnstile_verify_api(body: TurnstileVerifyIn = Body(...)):
 async def turnstile_verify_root(body: TurnstileVerifyIn = Body(...)):
     return await _verify_turnstile_core(body)
 
-# Preflight OPTIONS dla obu ścieżek
 @app.options("/api/turnstile/verify")
 def turnstile_verify_api_options():
     return Response(status_code=204)
@@ -278,7 +250,7 @@ def turnstile_verify_api_options():
 def turnstile_verify_root_options():
     return Response(status_code=204)
 
-# ── CHAT (fallback demo; możesz zastąpić swoim LLM) ───────────────────────
+# ── CHAT (fallback) ───────────────────────────────────────────────────────
 def _extract_text(payload: Dict[str, Any]) -> str:
     for key in ("message", "text", "input"):
         v = payload.get(key)
@@ -311,10 +283,10 @@ async def chat(payload: Dict[str, Any] = Body(...)):
     reply_lang = pref or detect_lang(reply)
     return {"reply": reply, "lang": reply_lang}
 
-# ── ROOT ──────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"ok": True, "service": "jack-backend", "entrypoint": "main:app"}
+
 
 
 
